@@ -1154,114 +1154,178 @@ class LazyK8sApp(App):
                     yield RichLog(id="alumet-panel", highlight=False, markup=True)
         # Footer with keybindings
         yield Footer()
+
+
+        
+    alumet_node_data = {}
+    alumet_lock = __import__("threading").Lock()
+    alumet_last_seen_rapl = {}
+
     @work(exclusive=True, thread=True)
     def start_alumet_stream(self) -> None:
-        """Worker asynchrone avec diagnostic intégré pour traquer le blocage."""
+        """Déclenche le streaming multi-nœuds calqué sur le script fonctionnel."""
         import subprocess
+        import threading
         import time
 
         time.sleep(1)
+        self.safe_alumet_write("[bold yellow]🚀 Initialisation du moniteur multi-nœuds Alumet...[/]")
 
-        def safe_write(msg: str):
-            try:
-                self.call_from_thread(self.query_one("#alumet-panel", RichLog).write, msg)
-            except: pass
-
-        safe_write("[bold yellow][DEBUG] Initialisation du moniteur Alumet...[/]")
-
-        # 1. Récupérer le namespace actif pour le debug
-        ns = self.k8s_client.get_current_namespace()
-        safe_write(f"[bold white][DEBUG] Recherche dans le namespace actuel : '{ns}'[/]")
-
-        # 2. Trouver le pod (On cherche de manière plus large en enlevant --no-headers au début pour voir si kubectl répond)
-        cmd_find = ["kubectl", "get", "pods", "-n", ns, "-o", "custom-columns=NAME:.metadata.name", "--no-headers"]
+        # Détection de TOUS les pods et de leurs nœuds respectifs
+        cmd = ["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name,NODE:.spec.nodeName", "--no-headers"]
         try:
-            output = subprocess.check_output(cmd_find, text=True, stderr=subprocess.PIPE)
-            pod_name = None
+            output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
+            count = 0
             for line in output.split('\n'):
-                if "alumet-relay-client" in line:
-                    pod_name = line.strip()
-                    break
+                if "alumet-relay-client" in line and len(line.split()) == 2:
+                    p_name, n_name = line.split()
+                    # On lance un thread de flux par pod/nœud trouvé, comme ton script
+                    threading.Thread(target=self._stream_alumet_node_data, args=(p_name, n_name), daemon=True).start()
+                    count += 1
             
-            if not pod_name:
-                safe_write(f"[red][DEBUG] ERREUR : Aucun pod contenant 'alumet-relay-client' trouvé dans le namespace '{ns}'.[/]")
-                safe_write("[yellow][DEBUG] Astuce : Si Alumet est dans un autre namespace, spécifie-le explicitement dans le code.[/]")
-                return
-        except subprocess.CalledProcessError as e:
-            safe_write(f"[red][DEBUG] Erreur critique 'kubectl get pods' : {e.stderr}[/]")
-            return
-        except Exception as e:
-            safe_write(f"[red][DEBUG] Erreur inattendue : {e}[/]")
-            return
-
-        safe_write(f"[green][DEBUG] Pod ciblé avec succès : {pod_name}[/]")
-        safe_write("[bold yellow][DEBUG] Tentative de connexion au flux de données...[/]")
-
-        # 3. Lancement de la commande de streaming avec capture des erreurs (stderr)
-        # On essaie d'abord un tail simple sans stdbuf au cas où stdbuf poserait problème sous Nix
-        cmd_stream = ["kubectl", "exec", "-n", ns, "-i", pod_name, "--", "tail", "-f", "/tmp/energy_data.csv"]
-        
-        try:
-            process = subprocess.Popen(
-                cmd_stream, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE, 
-                text=True, 
-                bufsize=1
-            )
-        except Exception as e:
-            safe_write(f"[red][DEBUG] Impossible de lancer subprocess.Popen : {e}[/]")
-            return
-
-        # Thread secondaire ultra-simple pour lire les erreurs du flux en parallèle
-        def read_stderr(proc):
+            if count == 0:
+                self.safe_alumet_write("[red]❌ Aucun pod 'alumet-relay-client' détecté.[/]")
+            else:
+                self.safe_alumet_write(f"[green]✅ {count} flux Alumet nœud/pod démarrés avec succès.[/]\n")
+                
+            # Boucle principale du worker pour rafraîchir l'écran Textual à intervalles réguliers
             while True:
-                err_line = proc.stderr.readline()
-                if err_line:
-                    safe_write(f"[red][POD STDERR] {err_line.strip()}[/]")
-                if proc.poll() is not None:
-                    break
+                time.sleep(1)
+                if getattr(self, "show_alumet", False):
+                    self.call_from_thread(self._refresh_alumet_display)
 
-        import threading
-        threading.Thread(target=read_stderr, args=(process,), daemon=True).start()
+        except Exception as e:
+            self.safe_alumet_write(f"[red]❌ Erreur d'initialisation : {e}[/]")
 
-        # 4. Lecture du flux de données standard
-        line_count = 0
+    def _stream_alumet_node_data(self, pod_name: str, node_name: str) -> None:
+        """Équivalent strict de ta fonction stream_data(pod_name, node_name)"""
+        import subprocess
+        from datetime import datetime, timezone
+        
+        metrics_list = [
+            "rapl_consumed_energy", "cpu_percent", "memory_usage",
+            "cgroup_memory_anonymous", "cgroup_memory_file",
+            "cgroup_memory_kernel_stack", "cgroup_memory_pagetables",
+            "nvml_instant_power", "nvml_temperature_gpu", 
+            "nvml_gpu_utilization", "nvml_memory_utilization"
+        ]
+
+        def parse_ts(ts_str):
+            try:
+                return datetime.fromisoformat(ts_str.replace('Z', '')).replace(tzinfo=timezone.utc).timestamp()
+            except: return __import__("time").time()
+
+        cmd = ["kubectl", "exec", "-i", pod_name, "--", "stdbuf", "-oL", "tail", "-f", "/tmp/energy_data.csv"]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        
         while True:
             line = process.stdout.readline()
-            if not line:
-                if process.poll() is not None:
-                    safe_write(f"[red][DEBUG] Le processus kubectl exec s'est arrêté avec le code de sortie : {process.returncode}[/]")
-                    break
-                continue
-            
-            line_count += 1
+            if not line: break
             line = line.strip()
-            
-            # Afficher absolument TOUT au début pour valider que les données arrivent
-            if line_count <= 5:
-                safe_write(f"[bold dim][RAW DATA] {line[:80]}[/]")
-
-            if ";" not in line:
-                continue
+            if ";" not in line: continue
             
             parts = line.split(";")
-            if len(parts) < 3:
-                continue
+            if len(parts) < 3: continue
             
-            m_name, _, val_raw = parts[0], parts[1], parts[2]
+            m_name, ts_raw, val_raw = parts[0], parts[1], parts[2]
+            try: val = float(val_raw)
+            except: continue
+            curr_ts = parse_ts(ts_raw)
             
-            if "rapl_consumed_energy" in m_name and "domain=package_total" in line:
-                safe_write(f"[bold yellow]⚡ POWER (RAPL):[/] [bold green]{val_raw} W[/]")
-            elif "nvml_" in m_name:
-                gpu_id = parts[4][-12:] if len(parts) > 4 else "0"
-                metric = m_name.split("nvml_")[-1]
-                safe_write(f"[bold magenta]🎮 GPU [{gpu_id}]:[/] {metric} -> [cyan]{val_raw}[/cyan]")
-            elif "memory_usage" in m_name:
-                try:
-                    mib = float(val_raw) / (1024**2)
-                    safe_write(f"[bold blue]💾 MEMORY:[/] Usage: [bold]{mib:.2f} MiB[/bold]")
-                except: pass
+            with self.alumet_lock:
+                if node_name not in self.alumet_node_data:
+                    self.alumet_node_data[node_name] = {m: {'curr': 0.0} for m in metrics_list}
+                    self.alumet_node_data[node_name]['pods_cpu_usage'] = {} 
+                    self.alumet_node_data[node_name]['gpus'] = {}
+
+                # --- 1. ÉNERGIE CPU (RAPL) ---
+                if "rapl_consumed_energy" in m_name and "domain=package_total" in line:
+                    m_id = f"{node_name}_package_total"
+                    if m_id in self.alumet_last_seen_rapl:
+                        p_ts, _ = self.alumet_last_seen_rapl[m_id]
+                        dt = curr_ts - p_ts
+                        if 0.001 < dt < 5.0:
+                            watts = val / dt
+                            if 0 <= watts < 1000.0:
+                                self.alumet_node_data[node_name]['rapl_consumed_energy']['curr'] = watts
+                    self.alumet_last_seen_rapl[m_id] = (curr_ts, val)
+
+                # --- 2. GPU NVIDIA ---
+                elif "nvml_" in m_name:
+                    gpu_id = parts[4] if len(parts) > 4 else "0"
+                    if gpu_id not in self.alumet_node_data[node_name]['gpus']:
+                        self.alumet_node_data[node_name]['gpus'][gpu_id] = {m: {'curr': 0.0} for m in metrics_list if "nvml" in m}
+                    
+                    f_val = val / 1000.0 if "power" in m_name else val
+                    for m_key in metrics_list:
+                        if m_key in m_name:
+                            self.alumet_node_data[node_name]['gpus'][gpu_id][m_key]['curr'] = f_val
+                            break
+
+                # --- 3. PODS CPU ---
+                elif "cpu_percent" in m_name and "kind=total" in line:
+                    try:
+                        p_name = line.split("name=")[1].split(",")[0]
+                        self.alumet_node_data[node_name]['pods_cpu_usage'][p_name] = val
+                    except: pass            
+
+                # --- 4. MÉMOIRE ---
+                else:
+                    for m_key in ["memory_usage", "cgroup_memory_anonymous", "cgroup_memory_file", "cgroup_memory_kernel_stack", "cgroup_memory_pagetables"]:
+                        if m_name.startswith(m_key):
+                            self.alumet_node_data[node_name][m_key]['curr'] = val / (1024**2)
+                            break
+
+    def _refresh_alumet_display(self) -> None:
+        """Génère le rendu visuel textuel propre à partir des données collectées."""
+        try:
+            panel = self.query_one("#alumet-panel", RichLog)
+            panel.clear()
+
+            with self.alumet_lock:
+                if not self.alumet_node_data:
+                    panel.write("[bold blink cyan]⏳ ATTENTE DE DONNÉES ALUMET DES NŒUDS...[/]")
+                    return
+
+                for node, data in sorted(self.alumet_node_data.items()):
+                    panel.write(f"[bold reverse cyan] 🖥️  NODE: {node} [/bold reverse cyan]")
+                    
+                    # Consommation d'énergie globale (RAPL)
+                    p_curr = data['rapl_consumed_energy']['curr']
+                    panel.write(f"  [bold yellow]⚡ TOTAL POWER (RAPL):[/] [green]{p_curr:>6.2f} W[/green]")
+                    
+                    # Affichage de la mémoire
+                    panel.write("  [bold blue]💾 DETAILED MEMORY (MiB):[/]")
+                    mem_keys = ["cgroup_memory_anonymous", "cgroup_memory_file", "cgroup_memory_kernel_stack", "cgroup_memory_pagetables"]
+                    mem_line = "    " + " | ".join([f"{m[14:].upper()}: [bold]{data[m]['curr']:.2f}[/] MiB" for m in mem_keys if m in data])
+                    panel.write(mem_line)
+
+                    # Section GPU si présente
+                    gpus = data.get('gpus', {})
+                    if gpus:
+                        panel.write("  [bold magenta]🎮 GPU METRICS:[/]")
+                        for g_id, g_metrics in sorted(gpus.items()):
+                            pwr = g_metrics.get('nvml_instant_power', {}).get('curr', 0.0)
+                            tmp = g_metrics.get('nvml_temperature_gpu', {}).get('curr', 0.0)
+                            util = g_metrics.get('nvml_gpu_utilization', {}).get('curr', 0.0)
+                            mem = g_metrics.get('nvml_memory_utilization', {}).get('curr', 0.0)
+                            panel.write(f"    └─ [bold]ID {g_id[-12:]}:[/] Power: [green]{pwr:.1f}W[/] | Temp: {tmp:.1f}°C | Util: [cyan]{util:.1f}%[/] | Mem: {mem:.1f}%")
+
+                    # Section Top Pods
+                    pods = sorted(data.get('pods_cpu_usage', {}).items(), key=lambda x: x[1], reverse=True)[:4]
+                    if pods:
+                        panel.write("  [bold orange3]🔥 TOP PODS (CPU%):[/]")
+                        for p_name, p_val in pods:
+                            panel.write(f"    ├─ {p_name[:30]:30} [cyan]{p_val:>5.1f}%[/cyan]")
+                    
+                    panel.write("─" * 50) # Séparateur entre les nœuds
+        except Exception:
+            pass
+
+    def safe_alumet_write(self, msg: str) -> None:
+        """Écrit un message de log simple de manière thread-safe."""
+        try: self.call_from_thread(self.query_one("#alumet-panel", RichLog).write, msg)
+        except: pass
 
 
     def update_alumet_ui(self, text: str) -> None:
