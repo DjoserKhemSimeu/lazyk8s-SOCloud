@@ -1156,11 +1156,10 @@ class LazyK8sApp(App):
         yield Footer()
     @work(exclusive=True, thread=True)
     def start_alumet_stream(self) -> None:
-        """Worker asynchrone qui récupère et formate le flux CSV Alumet."""
+        """Worker asynchrone avec diagnostic intégré pour traquer le blocage."""
         import subprocess
         import time
 
-        # Attente pour s'assurer que le TUI est bien monté
         time.sleep(1)
 
         def safe_write(msg: str):
@@ -1168,11 +1167,16 @@ class LazyK8sApp(App):
                 self.call_from_thread(self.query_one("#alumet-panel", RichLog).write, msg)
             except: pass
 
-        safe_write("[bold yellow]Searching for Alumet Relay Client Pod...[/]")
+        safe_write("[bold yellow][DEBUG] Initialisation du moniteur Alumet...[/]")
 
-        cmd_find = ["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name", "--no-headers"]
+        # 1. Récupérer le namespace actif pour le debug
+        ns = self.k8s_client.get_current_namespace()
+        safe_write(f"[bold white][DEBUG] Recherche dans le namespace actuel : '{ns}'[/]")
+
+        # 2. Trouver le pod (On cherche de manière plus large en enlevant --no-headers au début pour voir si kubectl répond)
+        cmd_find = ["kubectl", "get", "pods", "-n", ns, "-o", "custom-columns=NAME:.metadata.name", "--no-headers"]
         try:
-            output = subprocess.check_output(cmd_find, text=True, stderr=subprocess.DEVNULL).strip()
+            output = subprocess.check_output(cmd_find, text=True, stderr=subprocess.PIPE)
             pod_name = None
             for line in output.split('\n'):
                 if "alumet-relay-client" in line:
@@ -1180,32 +1184,64 @@ class LazyK8sApp(App):
                     break
             
             if not pod_name:
-                safe_write("[red]Error: No pod named 'alumet-relay-client' found in this namespace.[/]")
+                safe_write(f"[red][DEBUG] ERREUR : Aucun pod contenant 'alumet-relay-client' trouvé dans le namespace '{ns}'.[/]")
+                safe_write("[yellow][DEBUG] Astuce : Si Alumet est dans un autre namespace, spécifie-le explicitement dans le code.[/]")
                 return
+        except subprocess.CalledProcessError as e:
+            safe_write(f"[red][DEBUG] Erreur critique 'kubectl get pods' : {e.stderr}[/]")
+            return
         except Exception as e:
-            safe_write(f"[red]Kubectl error: {e}[/]")
+            safe_write(f"[red][DEBUG] Erreur inattendue : {e}[/]")
             return
 
-        safe_write(f"[green]Found Pod: {pod_name}. Connecting to energy stream...[/]")
+        safe_write(f"[green][DEBUG] Pod ciblé avec succès : {pod_name}[/]")
+        safe_write("[bold yellow][DEBUG] Tentative de connexion au flux de données...[/]")
 
-        # Lancement du tail avec un buffer forcé à vide pour du vrai temps réel
-        cmd_stream = ["kubectl", "exec", "-i", pod_name, "--", "stdbuf", "-oL", "tail", "-f", "/tmp/energy_data.csv"]
+        # 3. Lancement de la commande de streaming avec capture des erreurs (stderr)
+        # On essaie d'abord un tail simple sans stdbuf au cas où stdbuf poserait problème sous Nix
+        cmd_stream = ["kubectl", "exec", "-n", ns, "-i", pod_name, "--", "tail", "-f", "/tmp/energy_data.csv"]
+        
         try:
-            process = subprocess.Popen(cmd_stream, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+            process = subprocess.Popen(
+                cmd_stream, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
+                text=True, 
+                bufsize=1
+            )
         except Exception as e:
-            safe_write(f"[red]Failed to execute kubectl exec: {e}[/]")
+            safe_write(f"[red][DEBUG] Impossible de lancer subprocess.Popen : {e}[/]")
             return
 
+        # Thread secondaire ultra-simple pour lire les erreurs du flux en parallèle
+        def read_stderr(proc):
+            while True:
+                err_line = proc.stderr.readline()
+                if err_line:
+                    safe_write(f"[red][POD STDERR] {err_line.strip()}[/]")
+                if proc.poll() is not None:
+                    break
+
+        import threading
+        threading.Thread(target=read_stderr, args=(process,), daemon=True).start()
+
+        # 4. Lecture du flux de données standard
+        line_count = 0
         while True:
             line = process.stdout.readline()
             if not line:
-                # Vérification si le processus est mort
                 if process.poll() is not None:
-                    safe_write("[red]Stream disconnected unexpectedly.[/]")
+                    safe_write(f"[red][DEBUG] Le processus kubectl exec s'est arrêté avec le code de sortie : {process.returncode}[/]")
                     break
                 continue
             
+            line_count += 1
             line = line.strip()
+            
+            # Afficher absolument TOUT au début pour valider que les données arrivent
+            if line_count <= 5:
+                safe_write(f"[bold dim][RAW DATA] {line[:80]}[/]")
+
             if ";" not in line:
                 continue
             
@@ -1215,15 +1251,12 @@ class LazyK8sApp(App):
             
             m_name, _, val_raw = parts[0], parts[1], parts[2]
             
-            # --- Formatage Rich Text ---
             if "rapl_consumed_energy" in m_name and "domain=package_total" in line:
                 safe_write(f"[bold yellow]⚡ POWER (RAPL):[/] [bold green]{val_raw} W[/]")
-                
             elif "nvml_" in m_name:
                 gpu_id = parts[4][-12:] if len(parts) > 4 else "0"
                 metric = m_name.split("nvml_")[-1]
                 safe_write(f"[bold magenta]🎮 GPU [{gpu_id}]:[/] {metric} -> [cyan]{val_raw}[/cyan]")
-                
             elif "memory_usage" in m_name:
                 try:
                     mib = float(val_raw) / (1024**2)
@@ -1231,7 +1264,6 @@ class LazyK8sApp(App):
                 except: pass
 
 
-                
     def update_alumet_ui(self, text: str) -> None:
         """Met à jour le panneau Alumet (exécuté sur le thread principal)."""
         panel = self.query_one("#alumet-panel", RichLog)
