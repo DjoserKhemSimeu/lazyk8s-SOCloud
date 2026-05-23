@@ -128,3 +128,5 @@ dmypy.json
 *.swp
 *.swo
 *~
+shell.nix
+.envrc
