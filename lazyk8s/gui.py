@@ -1110,6 +1110,7 @@ class LazyK8sApp(App):
     selected_container: reactive[Optional[str]] = reactive(None)
     current_namespace: reactive[str] = reactive("default")
     following_logs: reactive[bool] = reactive(False)
+    show_alumet: reactive[bool] = reactive(False)
 
     def __init__(self, k8s_client: K8sClient, app_config: AppConfig):
         super().__init__()
@@ -1150,43 +1151,60 @@ class LazyK8sApp(App):
                             yield RichLog(id="metadata-panel", highlight=True, markup=True)
                         with TabPane("Alumet", id="alumet-tab"):
                             yield RichLog(id="alumet-panel", highlight=False, markup=True)
-
+                    yield RichLog(id="alumet-panel", highlight=False, markup=True)
         # Footer with keybindings
         yield Footer()
     @work(exclusive=True, thread=True)
     def start_alumet_stream(self) -> None:
-        """Worker en tâche de fond qui lit le flux Alumet et met à jour l'onglet."""
+        """Worker asynchrone qui récupère et formate le flux CSV Alumet."""
         import subprocess
-        
-        # 1. Trouver le pod alumet-relay-client
-        cmd_find = ["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name,NODE:.spec.nodeName", "--no-headers"]
+        import time
+
+        # Attente pour s'assurer que le TUI est bien monté
+        time.sleep(1)
+
+        def safe_write(msg: str):
+            try:
+                self.call_from_thread(self.query_one("#alumet-panel", RichLog).write, msg)
+            except: pass
+
+        safe_write("[bold yellow]Searching for Alumet Relay Client Pod...[/]")
+
+        cmd_find = ["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name", "--no-headers"]
         try:
             output = subprocess.check_output(cmd_find, text=True, stderr=subprocess.DEVNULL).strip()
             pod_name = None
             for line in output.split('\n'):
                 if "alumet-relay-client" in line:
-                    pod_name = line.split()[0]
+                    pod_name = line.strip()
                     break
             
             if not pod_name:
-                self.call_from_thread(self.write_alumet_error, "Aucun pod alumet-relay-client trouvé.")
+                safe_write("[red]Error: No pod named 'alumet-relay-client' found in this namespace.[/]")
                 return
         except Exception as e:
-            self.call_from_thread(self.write_alumet_error, f"Erreur kubectl init : {e}")
+            safe_write(f"[red]Kubectl error: {e}[/]")
             return
 
-        # 2. Lancer le tail -f via kubectl exec
-        cmd_stream = ["kubectl", "exec", "-i", pod_name, "--", "stdbuf", "-oL", "tail", "-f", "/tmp/energy_data.csv"]
-        process = subprocess.Popen(cmd_stream, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
-        
-        self.call_from_thread(self.write_alumet_error, f"[green]Connecté au flux Alumet ({pod_name})...[/]")
+        safe_write(f"[green]Found Pod: {pod_name}. Connecting to energy stream...[/]")
 
-        # 3. Traiter le flux ligne par ligne
-        # Note : On simplifie l'affichage pour l'intégrer proprement en texte Rich
+        # Lancement du tail avec un buffer forcé à vide pour du vrai temps réel
+        cmd_stream = ["kubectl", "exec", "-i", pod_name, "--", "stdbuf", "-oL", "tail", "-f", "/tmp/energy_data.csv"]
+        try:
+            process = subprocess.Popen(cmd_stream, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        except Exception as e:
+            safe_write(f"[red]Failed to execute kubectl exec: {e}[/]")
+            return
+
         while True:
             line = process.stdout.readline()
             if not line:
-                break
+                # Vérification si le processus est mort
+                if process.poll() is not None:
+                    safe_write("[red]Stream disconnected unexpectedly.[/]")
+                    break
+                continue
+            
             line = line.strip()
             if ";" not in line:
                 continue
@@ -1195,26 +1213,25 @@ class LazyK8sApp(App):
             if len(parts) < 3:
                 continue
             
-            m_name, ts_raw, val_raw = parts[0], parts[1], parts[2]
+            m_name, _, val_raw = parts[0], parts[1], parts[2]
             
-            # Formatage propre pour l'affichage Textual
+            # --- Formatage Rich Text ---
             if "rapl_consumed_energy" in m_name and "domain=package_total" in line:
-                display_line = f"[bold yellow][RAPL POWER][/bold yellow] {m_name} -> [bold green]{val_raw} Joules/Deltas[/bold green]"
-                self.call_from_thread(self.update_alumet_ui, display_line)
+                safe_write(f"[bold yellow]⚡ POWER (RAPL):[/] [bold green]{val_raw} W[/]")
                 
             elif "nvml_" in m_name:
-                gpu_id = parts[4][-5:] if len(parts) > 4 else "0"
-                display_line = f"[bold magenta][GPU {gpu_id}][/bold magenta] {m_name.split('/')[-1]} : [cyan]{val_raw}[/cyan]"
-                self.call_from_thread(self.update_alumet_ui, display_line)
+                gpu_id = parts[4][-12:] if len(parts) > 4 else "0"
+                metric = m_name.split("nvml_")[-1]
+                safe_write(f"[bold magenta]🎮 GPU [{gpu_id}]:[/] {metric} -> [cyan]{val_raw}[/cyan]")
                 
             elif "memory_usage" in m_name:
                 try:
                     mib = float(val_raw) / (1024**2)
-                    display_line = f"[bold blue][MEMORY][/bold blue] Usage: [bold]{mib:.2f} MiB[/bold]"
-                    self.call_from_thread(self.update_alumet_ui, display_line)
-                except:
-                    pass
+                    safe_write(f"[bold blue]💾 MEMORY:[/] Usage: [bold]{mib:.2f} MiB[/bold]")
+                except: pass
 
+
+                
     def update_alumet_ui(self, text: str) -> None:
         """Met à jour le panneau Alumet (exécuté sur le thread principal)."""
         panel = self.query_one("#alumet-panel", RichLog)
@@ -1224,6 +1241,25 @@ class LazyK8sApp(App):
     def write_alumet_error(self, text: str) -> None:
         """Affiche un message d'état dans le panneau."""
         self.query_one("#alumet-panel", RichLog).write(text)
+
+    def watch_show_alumet(self, show_alumet: bool) -> None:
+        """Bascule visuellement entre les onglets K8s standards et le moniteur Alumet."""
+        try:
+            tabs = self.query_one("#logs-tabs")
+            alumet_panel = self.query_one("#alumet-panel")
+            container = self.query_one("#logs-container")
+
+            if show_alumet:
+                tabs.display = False
+                alumet_panel.display = True
+                container.border_title = "[bold green]ALUMET ENERGY MONITOR FIELD (Press 'a' to exit)[/]"
+            else:
+                tabs.display = True
+                alumet_panel.display = False
+                self.update_logs_title()
+        except Exception:
+            pass
+
     def on_mount(self) -> None:
         """Called when app is mounted"""
         self.title = "lazyk8s"
@@ -1850,8 +1886,8 @@ class LazyK8sApp(App):
             input()
 
     def action_open_alumet(self) -> None:
-        """Bascule directement sur l'onglet Alumet intégré."""
-        self.action_switch_tab('alumet-tab')
+        """Active ou désactive l'affichage du moniteur Alumet intégré."""
+        self.show_alumet = not self.show_alumet
 
     def action_delete_pod(self) -> None:
         """Delete the selected pod after confirmation"""
