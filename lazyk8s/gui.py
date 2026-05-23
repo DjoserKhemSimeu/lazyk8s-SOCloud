@@ -649,6 +649,7 @@ class ClusterOverview(ModalScreen[bool]):
         # Vim navigation
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
+        
     ]
 
     def __init__(self, k8s_client: K8sClient):
@@ -1147,10 +1148,82 @@ class LazyK8sApp(App):
                             yield RichLog(id="events-panel", highlight=True, markup=True)
                         with TabPane("Metadata", id="metadata-tab"):
                             yield RichLog(id="metadata-panel", highlight=True, markup=True)
+                        with TabPane("Alumet", id="alumet-tab"):
+                            yield RichLog(id="alumet-panel", highlight=False, markup=True)
 
         # Footer with keybindings
         yield Footer()
+    @work(exclusive=True, thread=True)
+    def start_alumet_stream(self) -> None:
+        """Worker en tâche de fond qui lit le flux Alumet et met à jour l'onglet."""
+        import subprocess
+        
+        # 1. Trouver le pod alumet-relay-client
+        cmd_find = ["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name,NODE:.spec.nodeName", "--no-headers"]
+        try:
+            output = subprocess.check_output(cmd_find, text=True, stderr=subprocess.DEVNULL).strip()
+            pod_name = None
+            for line in output.split('\n'):
+                if "alumet-relay-client" in line:
+                    pod_name = line.split()[0]
+                    break
+            
+            if not pod_name:
+                self.call_from_thread(self.write_alumet_error, "Aucun pod alumet-relay-client trouvé.")
+                return
+        except Exception as e:
+            self.call_from_thread(self.write_alumet_error, f"Erreur kubectl init : {e}")
+            return
 
+        # 2. Lancer le tail -f via kubectl exec
+        cmd_stream = ["kubectl", "exec", "-i", pod_name, "--", "stdbuf", "-oL", "tail", "-f", "/tmp/energy_data.csv"]
+        process = subprocess.Popen(cmd_stream, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        
+        self.call_from_thread(self.write_alumet_error, f"[green]Connecté au flux Alumet ({pod_name})...[/]")
+
+        # 3. Traiter le flux ligne par ligne
+        # Note : On simplifie l'affichage pour l'intégrer proprement en texte Rich
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            if ";" not in line:
+                continue
+            
+            parts = line.split(";")
+            if len(parts) < 3:
+                continue
+            
+            m_name, ts_raw, val_raw = parts[0], parts[1], parts[2]
+            
+            # Formatage propre pour l'affichage Textual
+            if "rapl_consumed_energy" in m_name and "domain=package_total" in line:
+                display_line = f"[bold yellow][RAPL POWER][/bold yellow] {m_name} -> [bold green]{val_raw} Joules/Deltas[/bold green]"
+                self.call_from_thread(self.update_alumet_ui, display_line)
+                
+            elif "nvml_" in m_name:
+                gpu_id = parts[4][-5:] if len(parts) > 4 else "0"
+                display_line = f"[bold magenta][GPU {gpu_id}][/bold magenta] {m_name.split('/')[-1]} : [cyan]{val_raw}[/cyan]"
+                self.call_from_thread(self.update_alumet_ui, display_line)
+                
+            elif "memory_usage" in m_name:
+                try:
+                    mib = float(val_raw) / (1024**2)
+                    display_line = f"[bold blue][MEMORY][/bold blue] Usage: [bold]{mib:.2f} MiB[/bold]"
+                    self.call_from_thread(self.update_alumet_ui, display_line)
+                except:
+                    pass
+
+    def update_alumet_ui(self, text: str) -> None:
+        """Met à jour le panneau Alumet (exécuté sur le thread principal)."""
+        panel = self.query_one("#alumet-panel", RichLog)
+        # On garde par exemple les 100 dernières lignes pour ne pas surcharger la RAM
+        panel.write(text)
+
+    def write_alumet_error(self, text: str) -> None:
+        """Affiche un message d'état dans le panneau."""
+        self.query_one("#alumet-panel", RichLog).write(text)
     def on_mount(self) -> None:
         """Called when app is mounted"""
         self.title = "lazyk8s"
@@ -1777,45 +1850,8 @@ class LazyK8sApp(App):
             input()
 
     def action_open_alumet(self) -> None:
-        """Launch the alumet_top_GPU.py script directly in the current terminal."""
-        # 1. Localiser le script Alumet
-        script_path = Path(__file__).parent / "alumet_top_GPU.py"
-        if not script_path.exists():
-            try:
-                self.app_config.logger.error(f"alumet script not found: {script_path}")
-            except Exception:
-                pass
-            return
-
-        # 2. On suspend proprement l'application Textual (lazyk8s)
-        with self.suspend():
-            # Nettoyer l'écran pour Curses
-            print("\033[H\033[2J", end="") 
-            
-            import subprocess
-            try:
-                # IMPORTANT : On lance le script de manière SYNCHRONE (.run) dans le terminal actuel
-                # Cela permet à Curses (dans Alumet) de prendre le contrôle complet du terminal
-                subprocess.run(["python3", str(script_path)])
-            except Exception as e:
-                try:
-                    self.app_config.logger.error(f"Alumet execution failed: {e}")
-                except Exception:
-                    pass
-
-            # Message de transition lors de la fermeture d'Alumet (lors de l'appui sur 'q')
-            separator = "─" * 60
-            print(f"\n\033[36m{separator}\033[0m")
-            print(f"\033[36m← \033[1;37mExited Alumet Monitor\033[0m")
-            print(f"\033[2mPress \033[0m\033[1;32mEnter\033[0m\033[2m to return to \033[0m\033[1;36mlazyk8s\033[0m\033[2m...\033[0m")
-            print(f"\033[36m{separator}\033[0m")
-            input()
-
-        # 3. Rafraîchir lazyk8s au retour
-        self.refresh_pods()
-        if self.selected_pod:
-            self.show_pod_info()
-            self.show_pod_logs()
+        """Bascule directement sur l'onglet Alumet intégré."""
+        self.action_switch_tab('alumet-tab')
 
     def action_delete_pod(self) -> None:
         """Delete the selected pod after confirmation"""
