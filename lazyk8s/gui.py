@@ -1777,8 +1777,8 @@ class LazyK8sApp(App):
             input()
 
     def action_open_alumet(self) -> None:
-        """Launch the alumet_top_GPU.py script in an external terminal."""
-        # Locate the script next to this module
+        """Launch the alumet_top_GPU.py script directly in the current terminal."""
+        # 1. Localiser le script Alumet
         script_path = Path(__file__).parent / "alumet_top_GPU.py"
         if not script_path.exists():
             try:
@@ -1787,77 +1787,31 @@ class LazyK8sApp(App):
                 pass
             return
 
-        # Detect available terminal emulator
-        terminals = ["gnome-terminal", "konsole", "xfce4-terminal", "xterm", "alacritty", "kitty", "urxvt"]
-        terminal = None
-        for t in terminals:
-            if shutil.which(t):
-                terminal = t
-                break
-
-        # Build command based on terminal
-        if terminal:
-            if terminal == "gnome-terminal":
-                cmd = [terminal, "--", "bash", "-lc", f'python3 "{script_path}"; exec bash']
-            elif terminal in ("konsole",):
-                cmd = [terminal, "-e", f'bash -lc "python3 \"{script_path}\"; exec bash"']
-            else:
-                # Generic -e support
-                cmd = [terminal, "-e", "bash", "-lc", f'python3 "{script_path}"; exec bash']
-        else:
-            # No terminal emulator found: run in background (no window)
-            cmd = ["python3", str(script_path)]
-
-        # Launch the terminal while suspending the TUI briefly.
-        # If terminal launch fails (DBus activation errors on some systems),
-        # try fallbacks and finally run the script in the current terminal.
-        tried = []
-        def try_cmd(c):
-            tried.append(c[0] if c else "(inline)")
+        # 2. On suspend proprement l'application Textual (lazyk8s)
+        with self.suspend():
+            # Nettoyer l'écran pour Curses
+            print("\033[H\033[2J", end="") 
+            
+            import subprocess
             try:
-                subprocess.Popen(c)
-                return True
+                # IMPORTANT : On lance le script de manière SYNCHRONE (.run) dans le terminal actuel
+                # Cela permet à Curses (dans Alumet) de prendre le contrôle complet du terminal
+                subprocess.run(["python3", str(script_path)])
             except Exception as e:
                 try:
-                    self.app_config.logger.error(f"alumet launch failed ({c}): {e}")
+                    self.app_config.logger.error(f"Alumet execution failed: {e}")
                 except Exception:
                     pass
-                return False
 
-        launched = False
-        # First attempt: normal launch
-        with self.suspend():
-            if try_cmd(cmd):
-                launched = True
+            # Message de transition lors de la fermeture d'Alumet (lors de l'appui sur 'q')
+            separator = "─" * 60
+            print(f"\n\033[36m{separator}\033[0m")
+            print(f"\033[36m← \033[1;37mExited Alumet Monitor\033[0m")
+            print(f"\033[2mPress \033[0m\033[1;32mEnter\033[0m\033[2m to return to \033[0m\033[1;36mlazyk8s\033[0m\033[2m...\033[0m")
+            print(f"\033[36m{separator}\033[0m")
+            input()
 
-            # If gnome-terminal failed due to DBus, try with dbus-run-session if available
-            if not launched and shutil.which("dbus-run-session") and cmd and 'gnome-terminal' in cmd[0]:
-                dbus_cmd = ["dbus-run-session"] + cmd
-                if try_cmd(dbus_cmd):
-                    launched = True
-
-            # Try other common terminals if initial choice failed
-            if not launched:
-                alt_terminals = ["xterm", "alacritty", "kitty", "uxterm", "urxvt", "konsole"]
-                for t in alt_terminals:
-                    if shutil.which(t):
-                        alt_cmd = [t, "-e", "bash", "-lc", f'python3 "{script_path}"; exec bash'] if t not in ("konsole",) else [t, "-e", f'bash -lc "python3 \"{script_path}\"; exec bash"']
-                        if try_cmd(alt_cmd):
-                            launched = True
-                            break
-
-            # Final fallback: run inline in suspended TUI (will show curses UI in same terminal)
-            if not launched:
-                try:
-                    subprocess.run(["python3", str(script_path)])
-                    launched = True
-                except Exception as e:
-                    try:
-                        self.app_config.logger.error(f"Final fallback run failed: {e} (tried: {tried})")
-                    except Exception:
-                        pass
-
-        # Refresh the display after returning
+        # 3. Rafraîchir lazyk8s au retour
         self.refresh_pods()
         if self.selected_pod:
             self.show_pod_info()
