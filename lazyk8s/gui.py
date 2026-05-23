@@ -510,12 +510,10 @@ class NodeItem(ListItem):
         roles = []
         if node.metadata.labels:
             for label, value in node.metadata.labels.items():
-                # Check both formats: node-role.kubernetes.io/<role> and node-role.kubernetes.io/<role>=""
                 if 'node-role.kubernetes.io/' in label:
                     role = label.split('/')[-1]
                     if role:
                         roles.append(role)
-                # Also check for control-plane/master specific labels
                 elif label == 'node-role.kubernetes.io/control-plane' or label == 'node-role.kubernetes.io/master':
                     if 'control-plane' not in roles and 'master' not in roles:
                         roles.append('control-plane')
@@ -529,7 +527,6 @@ class NodeItem(ListItem):
             cpu_percent = node_metrics['cpu_percent'].rstrip('%')
             mem_percent = node_metrics['memory_percent'].rstrip('%')
 
-            # Color code based on utilization
             try:
                 cpu_val = float(cpu_percent)
                 cpu_color = "green" if cpu_val < 70 else "yellow" if cpu_val < 90 else "red"
@@ -550,7 +547,6 @@ class NodeItem(ListItem):
         podStr = alignText(f"{pod_count}/{max_pods}", 12, alignment='right')
         nameStr = alignText(self.node_name, 30, alignment='left', trimFromFront=True)
 
-        # Format: status • name | pods | cpu | mem | role
         label_text = f"{status_icon} {nameStr} {podStr}   {cpu_str} {mem_str} [dim]{role_str}[/]"
         super().__init__(Label(label_text))
 
@@ -646,10 +642,8 @@ class ClusterOverview(ModalScreen[bool]):
         Binding("ctrl+c", "close", "Close"),
         Binding("r", "refresh", "Refresh"),
         Binding("x", "ssh_node", "SSH"),
-        # Vim navigation
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
-        
     ]
 
     def __init__(self, k8s_client: K8sClient):
@@ -676,41 +670,31 @@ class ClusterOverview(ModalScreen[bool]):
 
     def refresh_overview(self) -> None:
         """Refresh the cluster overview data"""
-        # Get cluster info
         cluster_name, _ = self.k8s_client.get_cluster_info()
-
-        # Get nodes
         self.nodes = self.k8s_client.get_nodes()
         if not self.nodes:
             summary = self.query_one("#overview-summary", Static)
             summary.update("[yellow]No nodes found[/]")
             return
 
-        # Get metrics and pod counts
         metrics = self.k8s_client.get_node_metrics()
         pod_counts = self.k8s_client.get_pod_count_per_node()
 
-        # Update summary
         total_pods = sum(pod_counts.values())
         summary = self.query_one("#overview-summary", Static)
         summary.update(f"[bold cyan]Cluster:[/] {cluster_name}  [bold cyan]Nodes:[/] {len(self.nodes)}  [bold cyan]Total Pods:[/] {total_pods}")
 
-        # Populate nodes list
         nodes_list = self.query_one("#nodes-list", ListView)
         nodes_list.clear()
 
         for node in self.nodes:
             name = node.metadata.name
             pod_count = pod_counts.get(name, 0)
-
-            # Get max pods
             max_pods = 110
             if node.status.allocatable and 'pods' in node.status.allocatable:
                 max_pods = int(node.status.allocatable['pods'])
-
             nodes_list.append(NodeItem(node, metrics, pod_count, max_pods))
 
-        # Focus and select first node
         nodes_list.focus()
         if len(nodes_list) > 0:
             nodes_list.index = 0
@@ -731,25 +715,20 @@ class ClusterOverview(ModalScreen[bool]):
             return
 
         node = self.selected_node
-
-        # Basic info
         details_content.write(f"[bold cyan]Name:[/] {node.metadata.name}")
 
-        # IP addresses
         if node.status.addresses:
             details_content.write(f"[bold cyan]Addresses:[/]")
             for addr in node.status.addresses:
                 details_content.write(f"  {addr.type}: [green]{addr.address}[/]")
         details_content.write("")
 
-        # Status
         details_content.write(f"[bold cyan]Status:[/]")
         for cond in node.status.conditions:
             status_color = "green" if cond.status == "True" else "red"
             details_content.write(f"  {cond.type}: [{status_color}]{cond.status}[/]")
         details_content.write("")
 
-        # Version info
         if node.status.node_info:
             info = node.status.node_info
             details_content.write(f"[bold cyan]System Info:[/]")
@@ -760,7 +739,6 @@ class ClusterOverview(ModalScreen[bool]):
             details_content.write(f"  Container Runtime: {info.container_runtime_version}")
             details_content.write("")
 
-        # Capacity and Allocatable
         if node.status.capacity:
             details_content.write(f"[bold cyan]Capacity:[/]")
             details_content.write(f"  CPU: {node.status.capacity.get('cpu', 'N/A')}")
@@ -775,7 +753,6 @@ class ClusterOverview(ModalScreen[bool]):
             details_content.write(f"  Pods: {node.status.allocatable.get('pods', 'N/A')}")
             details_content.write("")
 
-        # Labels
         if node.metadata.labels:
             details_content.write(f"[bold cyan]Labels:[/]")
             for key, value in sorted(node.metadata.labels.items()):
@@ -791,17 +768,12 @@ class ClusterOverview(ModalScreen[bool]):
             return
 
         node = self.selected_node
-
-        # Get IP address (prefer ExternalIP, fallback to InternalIP)
         ip_address = None
         if node.status.addresses:
-            # Try to find ExternalIP first
             for addr in node.status.addresses:
                 if addr.type == "ExternalIP":
                     ip_address = addr.address
                     break
-
-            # Fallback to InternalIP
             if not ip_address:
                 for addr in node.status.addresses:
                     if addr.type == "InternalIP":
@@ -811,17 +783,11 @@ class ClusterOverview(ModalScreen[bool]):
         if not ip_address:
             return
 
-        # Show username input dialog
-        username = await self.app.push_screen(
-            UsernameInputDialog(node.metadata.name)
-        )
-
+        username = await self.app.push_screen(UsernameInputDialog(node.metadata.name))
         if not username:
-            return  # User cancelled
+            return
 
-        # Exit the TUI temporarily
         with self.app.suspend():
-            # Colorful banner
             separator = "─" * 60
             print(f"\033[36m{separator}\033[0m")
             print(f"\033[36m→ \033[1;37mSSH to Node\033[0m")
@@ -830,14 +796,11 @@ class ClusterOverview(ModalScreen[bool]):
             print(f"  \033[2mIP:\033[0m \033[35m{ip_address}\033[0m")
             print(f"\033[36m{separator}\033[0m\n")
 
-            # Attempt SSH
-            import subprocess
             try:
                 subprocess.run(["ssh", f"{username}@{ip_address}"])
             except Exception as e:
                 print(f"\n\033[31mSSH failed: {e}\033[0m")
 
-            # Exit message
             print(f"\n\033[36m{separator}\033[0m")
             print(f"\033[36m← \033[1;37mExited SSH\033[0m")
             print(f"\033[2mPress \033[0m\033[1;32mEnter\033[0m\033[2m to return to \033[0m\033[1;36mlazyk8s\033[0m\033[2m...\033[0m")
@@ -857,21 +820,16 @@ class PodItem(ListItem):
         self.k8s_client = k8s_client
         status = k8s_client.get_pod_status(pod)
 
-        # Determine status with simple colored bullet
         phase = pod.status.phase
         if phase == "Running":
             ready = sum(1 for cs in (pod.status.container_statuses or []) if cs.ready)
             total = len(pod.status.container_statuses or [])
-            if ready == total and total > 0:
-                icon = "[green]●[/]"
-            else:
-                icon = "[yellow]●[/]"
+            icon = "[green]●[/]" if ready == total and total > 0 else "[yellow]●[/]"
         elif phase == "Pending":
             icon = "[yellow]●[/]"
         else:
             icon = "[red]●[/]"
 
-        # Simple format: status • name
         label_text = f"{icon} {pod.metadata.name}"
         super().__init__(Label(label_text))
 
@@ -882,7 +840,6 @@ class ContainerItem(ListItem):
     def __init__(self, container_name: str, is_active: bool = False) -> None:
         self.container_name = container_name
         self.is_active = is_active
-        # Show indicator if active
         indicator = "[green]●[/]" if is_active else "[dim]○[/]"
         super().__init__(Label(f"{indicator} {container_name}"))
 
@@ -897,7 +854,6 @@ class ContainerItem(ListItem):
 class LazyK8sApp(App):
     """Textual TUI for Kubernetes management"""
 
-    # Default to tokyo-night theme
     THEME = "tokyo-night"
 
     CSS = """
@@ -1092,16 +1048,13 @@ class LazyK8sApp(App):
         Binding("d", "delete_pod", "Delete"),
         Binding("space", "toggle_container", "Toggle Container", show=False),
         Binding("tab", "focus_next", "Next"),
-        # Tab switching (capital letters)
         Binding("L", "switch_tab('logs-tab')", "Logs", show=False),
         Binding("E", "switch_tab('events-tab')", "Events", show=False),
         Binding("M", "switch_tab('metadata-tab')", "Metadata", show=False),
-        # Vim navigation
         Binding("h", "scroll_log_left", "Scroll Left", show=False),
         Binding("l", "scroll_log_right", "Scroll Right", show=False),
         Binding("j", "cursor_down", "Down", show=False),
         Binding("k", "cursor_up", "Up", show=False),
-        # Arrow keys (keep existing)
         Binding("left", "scroll_log_left", "Scroll Left", show=False),
         Binding("right", "scroll_log_right", "Scroll Right", show=False),
     ]
@@ -1121,23 +1074,19 @@ class LazyK8sApp(App):
         self._debounce_timer: Optional[Timer] = None
         self._pending_pod_index: Optional[int] = None
         self._log_follow_timer: Optional[Timer] = None
-        self.active_containers: set[str] = set()  # Containers to show logs for
+        self.active_containers: set[str] = set()
 
     def compose(self) -> ComposeResult:
         """Create child widgets"""
-        # Status bar at top
         yield StatusBar(id="status-bar")
 
-        # Main content area
         with Horizontal(id="main-container"):
-            # Left panel with pods and containers
             with Vertical(id="left-panel"):
                 with Container(id="pods-container"):
                     yield ListView(id="pods-list")
                 with Container(id="containers-container"):
                     yield ListView(id="containers-list")
 
-            # Right panel with info and logs
             with Vertical(id="right-panel"):
                 with Container(id="info-container"):
                     yield Static(id="info-panel")
@@ -1149,14 +1098,10 @@ class LazyK8sApp(App):
                             yield RichLog(id="events-panel", highlight=True, markup=True)
                         with TabPane("Metadata", id="metadata-tab"):
                             yield RichLog(id="metadata-panel", highlight=True, markup=True)
-                        with TabPane("Alumet", id="alumet-tab"):
-                            yield RichLog(id="alumet-panel", highlight=False, markup=True)
+                    # FIX: Un seul panneau alumet-panel déclaré ici (celui du TabbedContent a été supprimé)
                     yield RichLog(id="alumet-panel", highlight=False, markup=True)
-        # Footer with keybindings
         yield Footer()
 
-
-        
     alumet_node_data = {}
     alumet_lock = __import__("threading").Lock()
     alumet_last_seen_rapl = {}
@@ -1171,7 +1116,6 @@ class LazyK8sApp(App):
         time.sleep(1)
         self.safe_alumet_write("[bold yellow]🚀 Initialisation du moniteur multi-nœuds Alumet...[/]")
 
-        # Détection de TOUS les pods et de leurs nœuds respectifs
         cmd = ["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name,NODE:.spec.nodeName", "--no-headers"]
         try:
             output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
@@ -1179,7 +1123,6 @@ class LazyK8sApp(App):
             for line in output.split('\n'):
                 if "alumet-relay-client" in line and len(line.split()) == 2:
                     p_name, n_name = line.split()
-                    # On lance un thread de flux par pod/nœud trouvé, comme ton script
                     threading.Thread(target=self._stream_alumet_node_data, args=(p_name, n_name), daemon=True).start()
                     count += 1
             
@@ -1188,7 +1131,6 @@ class LazyK8sApp(App):
             else:
                 self.safe_alumet_write(f"[green]✅ {count} flux Alumet nœud/pod démarrés avec succès.[/]\n")
                 
-            # Boucle principale du worker pour rafraîchir l'écran Textual à intervalles réguliers
             while True:
                 time.sleep(1)
                 if getattr(self, "show_alumet", False):
@@ -1198,7 +1140,6 @@ class LazyK8sApp(App):
             self.safe_alumet_write(f"[red]❌ Erreur d'initialisation : {e}[/]")
 
     def _stream_alumet_node_data(self, pod_name: str, node_name: str) -> None:
-        """Équivalent strict de ta fonction stream_data(pod_name, node_name)"""
         import subprocess
         from datetime import datetime, timezone
         
@@ -1238,7 +1179,6 @@ class LazyK8sApp(App):
                     self.alumet_node_data[node_name]['pods_cpu_usage'] = {} 
                     self.alumet_node_data[node_name]['gpus'] = {}
 
-                # --- 1. ÉNERGIE CPU (RAPL) ---
                 if "rapl_consumed_energy" in m_name and "domain=package_total" in line:
                     m_id = f"{node_name}_package_total"
                     if m_id in self.alumet_last_seen_rapl:
@@ -1250,7 +1190,6 @@ class LazyK8sApp(App):
                                 self.alumet_node_data[node_name]['rapl_consumed_energy']['curr'] = watts
                     self.alumet_last_seen_rapl[m_id] = (curr_ts, val)
 
-                # --- 2. GPU NVIDIA ---
                 elif "nvml_" in m_name:
                     gpu_id = parts[4] if len(parts) > 4 else "0"
                     if gpu_id not in self.alumet_node_data[node_name]['gpus']:
@@ -1262,14 +1201,12 @@ class LazyK8sApp(App):
                             self.alumet_node_data[node_name]['gpus'][gpu_id][m_key]['curr'] = f_val
                             break
 
-                # --- 3. PODS CPU ---
                 elif "cpu_percent" in m_name and "kind=total" in line:
                     try:
                         p_name = line.split("name=")[1].split(",")[0]
                         self.alumet_node_data[node_name]['pods_cpu_usage'][p_name] = val
                     except: pass            
 
-                # --- 4. MÉMOIRE ---
                 else:
                     for m_key in ["memory_usage", "cgroup_memory_anonymous", "cgroup_memory_file", "cgroup_memory_kernel_stack", "cgroup_memory_pagetables"]:
                         if m_name.startswith(m_key):
@@ -1290,17 +1227,14 @@ class LazyK8sApp(App):
                 for node, data in sorted(self.alumet_node_data.items()):
                     panel.write(f"[bold reverse cyan] 🖥️  NODE: {node} [/bold reverse cyan]")
                     
-                    # Consommation d'énergie globale (RAPL)
                     p_curr = data['rapl_consumed_energy']['curr']
                     panel.write(f"  [bold yellow]⚡ TOTAL POWER (RAPL):[/] [green]{p_curr:>6.2f} W[/green]")
                     
-                    # Affichage de la mémoire
                     panel.write("  [bold blue]💾 DETAILED MEMORY (MiB):[/]")
                     mem_keys = ["cgroup_memory_anonymous", "cgroup_memory_file", "cgroup_memory_kernel_stack", "cgroup_memory_pagetables"]
                     mem_line = "    " + " | ".join([f"{m[14:].upper()}: [bold]{data[m]['curr']:.2f}[/] MiB" for m in mem_keys if m in data])
                     panel.write(mem_line)
 
-                    # Section GPU si présente
                     gpus = data.get('gpus', {})
                     if gpus:
                         panel.write("  [bold magenta]🎮 GPU METRICS:[/]")
@@ -1311,35 +1245,28 @@ class LazyK8sApp(App):
                             mem = g_metrics.get('nvml_memory_utilization', {}).get('curr', 0.0)
                             panel.write(f"    └─ [bold]ID {g_id[-12:]}:[/] Power: [green]{pwr:.1f}W[/] | Temp: {tmp:.1f}°C | Util: [cyan]{util:.1f}%[/] | Mem: {mem:.1f}%")
 
-                    # Section Top Pods
                     pods = sorted(data.get('pods_cpu_usage', {}).items(), key=lambda x: x[1], reverse=True)[:4]
                     if pods:
                         panel.write("  [bold orange3]🔥 TOP PODS (CPU%):[/]")
                         for p_name, p_val in pods:
                             panel.write(f"    ├─ {p_name[:30]:30} [cyan]{p_val:>5.1f}%[/cyan]")
                     
-                    panel.write("─" * 50) # Séparateur entre les nœuds
+                    panel.write("─" * 50)
         except Exception:
             pass
 
     def safe_alumet_write(self, msg: str) -> None:
-        """Écrit un message de log simple de manière thread-safe."""
         try: self.call_from_thread(self.query_one("#alumet-panel", RichLog).write, msg)
         except: pass
 
-
     def update_alumet_ui(self, text: str) -> None:
-        """Met à jour le panneau Alumet (exécuté sur le thread principal)."""
         panel = self.query_one("#alumet-panel", RichLog)
-        # On garde par exemple les 100 dernières lignes pour ne pas surcharger la RAM
         panel.write(text)
 
     def write_alumet_error(self, text: str) -> None:
-        """Affiche un message d'état dans le panneau."""
         self.query_one("#alumet-panel", RichLog).write(text)
 
     def watch_show_alumet(self, show_alumet: bool) -> None:
-        """Bascule visuellement entre les onglets K8s standards et le moniteur Alumet."""
         try:
             tabs = self.query_one("#logs-tabs")
             alumet_panel = self.query_one("#alumet-panel")
@@ -1349,6 +1276,8 @@ class LazyK8sApp(App):
                 tabs.display = False
                 alumet_panel.display = True
                 container.border_title = "[bold green]ALUMET ENERGY MONITOR FIELD (Press 'a' to exit)[/]"
+                # Forcer un rafraîchissement visuel dès l'ouverture
+                self._refresh_alumet_display()
             else:
                 tabs.display = True
                 alumet_panel.display = False
@@ -1360,16 +1289,17 @@ class LazyK8sApp(App):
         """Called when app is mounted"""
         self.title = "lazyk8s"
 
-        # Set border titles for containers
         self.query_one("#pods-container").border_title = "Pods"
         self.query_one("#containers-container").border_title = "Containers [dim](Space to toggle)[/]"
         self.query_one("#info-container").border_title = "Info"
         self.update_logs_title()
 
+        # FIX: Masquer le panneau Alumet par défaut au démarrage
+        self.query_one("#alumet-panel").display = False
+
         self.refresh_status_bar()
         self.refresh_pods()
 
-        # Auto-select first pod if available
         if self.pods:
             self.selected_pod = self.pods[0]
             self.refresh_containers()
@@ -1378,8 +1308,10 @@ class LazyK8sApp(App):
             self.show_pod_events()
             self.show_pod_metadata()
 
+        # FIX CRITIQUE : Lancement automatique du flux en tâche de fond
+        self.start_alumet_stream()
+
     def refresh_status_bar(self) -> None:
-        """Update the status bar with cluster info"""
         host, _ = self.k8s_client.get_cluster_info()
         namespace = self.k8s_client.get_current_namespace()
         status_bar = self.query_one("#status-bar", StatusBar)
@@ -1388,93 +1320,63 @@ class LazyK8sApp(App):
         )
 
     def refresh_pods(self) -> None:
-        """Refresh the pods list"""
         self.pods = self.k8s_client.get_pods()
         pods_list = self.query_one("#pods-list", ListView)
         pods_list.clear()
-
         for pod in self.pods:
             pods_list.append(PodItem(pod, self.k8s_client))
 
     def refresh_containers(self) -> None:
-        """Refresh the containers list for selected pod"""
         containers_list = self.query_one("#containers-list", ListView)
         containers_list.clear()
-
         if self.selected_pod:
             containers = self.k8s_client.get_container_names(self.selected_pod)
-            # If no containers are active, activate all by default
             if not self.active_containers and containers:
                 self.active_containers = set(containers)
-
             for container in containers:
                 is_active = container in self.active_containers
                 containers_list.append(ContainerItem(container, is_active))
 
     def show_pod_info(self) -> None:
-        """Show information about the selected pod"""
         info_panel = self.query_one("#info-panel", Static)
-
         if not self.selected_pod:
             info_panel.update("[dim]no pod selected[/]")
             return
-
         pod = self.selected_pod
         info_lines = [
             f"[b]{pod.metadata.name}[/]",
             f"[dim]node:[/] {pod.spec.node_name or 'n/a'}  [dim]ip:[/] {pod.status.pod_ip or 'n/a'}",
             "",
         ]
-
         for container in pod.spec.containers:
             info_lines.append(f"[cyan]●[/] {container.name}")
             info_lines.append(f"  [dim]{container.image}[/]")
-
         info_panel.update("\n".join(info_lines))
 
     def show_pod_logs(self) -> None:
-        """Show logs for the selected pod/container(s)"""
         logs_panel = self.query_one("#logs-panel", RichLog)
         logs_panel.clear()
-
         if not self.selected_pod:
             logs_panel.write("[dim]no pod selected[/]")
             return
-
-        # Get active containers
         containers = self.k8s_client.get_container_names(self.selected_pod)
         if not containers:
             logs_panel.write("[dim]no containers found[/]")
             return
-
         active = [c for c in containers if c in self.active_containers]
         if not active:
             logs_panel.write("[dim]no active containers (press Space to toggle)[/]")
             return
-
-        # Get interlaced logs from all active containers
         if len(active) == 1:
-            # Single container - use simple method
-            logs = self.k8s_client.get_pod_logs(
-                self.selected_pod.metadata.name,
-                active[0],
-                lines=100
-            )
+            logs = self.k8s_client.get_pod_logs(self.selected_pod.metadata.name, active[0], lines=100)
             self._write_logs(logs_panel, logs, None)
         else:
-            # Multiple containers - get combined logs with prefix
-            logs = self.k8s_client.get_pod_logs_all_containers(
-                self.selected_pod.metadata.name,
-                active,
-                lines=100
-            )
+            logs = self.k8s_client.get_pod_logs_all_containers(self.selected_pod.metadata.name, active, lines=100)
             self._write_prefixed_logs(logs_panel, logs)
 
     def _write_logs(self, logs_panel: RichLog, logs: str, container_name: Optional[str]) -> None:
-        """Write logs with colorization"""
         for line in logs.split("\n"):
             if line:
-                # Apply minimal color based on log level
                 if any(level in line.upper() for level in ["ERROR", "FATAL"]):
                     logs_panel.write(f"[red]{line}[/]")
                 elif any(level in line.upper() for level in ["WARN", "WARNING"]):
@@ -1483,77 +1385,40 @@ class LazyK8sApp(App):
                     logs_panel.write(line)
 
     def _write_prefixed_logs(self, logs_panel: RichLog, logs: str) -> None:
-        """Write logs that have kubectl prefix format: [pod/container] timestamp line"""
         for line in logs.split("\n"):
-            if not line:
-                continue
-
-            # Parse kubectl prefix format: [pod/container] timestamp log_message
-            # Example: [myapp-5d4b7c9f6b-abc12/app] 2024-01-15T10:30:45.123456789Z Log message
+            if not line: continue
             if line.startswith("["):
                 try:
-                    # Extract container name from prefix
                     prefix_end = line.index("]")
-                    prefix = line[1:prefix_end]  # Remove [ and ]
-
-                    # Get container name (after the /)
-                    if "/" in prefix:
-                        container_name = prefix.split("/")[1]
-                    else:
-                        container_name = prefix
-
-                    # Get the rest of the line (after timestamp)
+                    prefix = line[1:prefix_end]
+                    container_name = prefix.split("/")[1] if "/" in prefix else prefix
                     rest = line[prefix_end + 1:].strip()
-
-                    # Remove timestamp if present (ISO 8601 format)
-                    if " " in rest:
-                        parts = rest.split(" ", 1)
-                        if len(parts) > 1:
-                            log_message = parts[1]
-                        else:
-                            log_message = rest
-                    else:
-                        log_message = rest
-
-                    # Format with container name and colorization
+                    log_message = rest.split(" ", 1)[1] if " " in rest else rest
                     container_tag = f"[cyan]{container_name}[/]"
 
-                    # Apply minimal color based on log level
                     if any(level in log_message.upper() for level in ["ERROR", "FATAL"]):
                         logs_panel.write(f"{container_tag} [red]{log_message}[/]")
                     elif any(level in log_message.upper() for level in ["WARN", "WARNING"]):
                         logs_panel.write(f"{container_tag} [yellow]{log_message}[/]")
                     else:
                         logs_panel.write(f"{container_tag} {log_message}")
-
                 except (ValueError, IndexError):
-                    # Couldn't parse, just write the line as-is
                     logs_panel.write(line)
             else:
-                # No prefix, just write the line
                 logs_panel.write(line)
 
     def show_pod_events(self) -> None:
-        """Show events for the selected pod"""
         events_panel = self.query_one("#events-panel", RichLog)
         events_panel.clear()
-
         if not self.selected_pod:
             events_panel.write("[dim]no pod selected[/]")
             return
-
         events = self.k8s_client.get_pod_events(self.selected_pod.metadata.name)
-
         if not events or events.strip() == "":
             events_panel.write("[dim]no events found[/]")
             return
-
-        # Display the events table from kubectl describe
         for line in events.split("\n"):
-            if not line.strip():
-                continue
-
-            # Color code based on keywords in the line
+            if not line.strip(): continue
             line_lower = line.lower()
             if "warning" in line_lower or "failed" in line_lower or "error" in line_lower:
                 events_panel.write(f"[yellow]{line}[/]")
@@ -1565,81 +1430,53 @@ class LazyK8sApp(App):
                 events_panel.write(line)
 
     def show_pod_metadata(self) -> None:
-        """Show metadata for the selected pod"""
         metadata_panel = self.query_one("#metadata-panel", RichLog)
         metadata_panel.clear()
-
         if not self.selected_pod:
             metadata_panel.write("[dim]no pod selected[/]")
             return
-
         pod = self.selected_pod
-
-        # Basic metadata
         metadata_panel.write(f"[bold cyan]Basic Information[/]")
         metadata_panel.write(f"  Name: [green]{pod.metadata.name}[/]")
         metadata_panel.write(f"  Namespace: [green]{pod.metadata.namespace}[/]")
         metadata_panel.write(f"  UID: [dim]{pod.metadata.uid}[/]")
-        metadata_panel.write(f"  Created: {pod.metadata.creation_timestamp}")
-        metadata_panel.write("")
+        metadata_panel.write(f"  Created: {pod.metadata.creation_timestamp}\n")
 
-        # Labels
         if pod.metadata.labels:
             metadata_panel.write(f"[bold cyan]Labels[/]")
             for key, value in sorted(pod.metadata.labels.items()):
                 metadata_panel.write(f"  [yellow]{key}[/]: {value}")
             metadata_panel.write("")
 
-        # Annotations
         if pod.metadata.annotations:
             metadata_panel.write(f"[bold cyan]Annotations[/]")
             for key, value in sorted(pod.metadata.annotations.items()):
-                # Truncate long values
-                if len(value) > 100:
-                    value = value[:97] + "..."
+                if len(value) > 100: value = value[:97] + "..."
                 metadata_panel.write(f"  [yellow]{key}[/]: [dim]{value}[/]")
             metadata_panel.write("")
 
-        # Spec details
         metadata_panel.write(f"[bold cyan]Spec[/]")
         metadata_panel.write(f"  Node: {pod.spec.node_name or 'N/A'}")
         metadata_panel.write(f"  Service Account: {pod.spec.service_account or 'default'}")
-        metadata_panel.write(f"  Restart Policy: {pod.spec.restart_policy}")
-        if pod.spec.priority:
-            metadata_panel.write(f"  Priority: {pod.spec.priority}")
-        metadata_panel.write("")
+        metadata_panel.write(f"  Restart Policy: {pod.spec.restart_policy}\n")
 
-        # Status details
         metadata_panel.write(f"[bold cyan]Status[/]")
         metadata_panel.write(f"  Phase: {pod.status.phase}")
         metadata_panel.write(f"  Pod IP: {pod.status.pod_ip or 'N/A'}")
-        metadata_panel.write(f"  Host IP: {pod.status.host_ip or 'N/A'}")
         metadata_panel.write(f"  QoS Class: {pod.status.qos_class or 'N/A'}")
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        """Handle cursor movement in lists with debouncing"""
         if event.list_view.id == "pods-list":
-            # Cancel any existing timer
             if self._debounce_timer is not None:
                 self._debounce_timer.stop()
-
-            # Get the highlighted index
             if event.item is not None and isinstance(event.item, PodItem):
-                # Store the pod index for later
                 self._pending_pod_index = self.pods.index(event.item.pod)
-
-                # Set a timer to trigger selection after 200ms
-                self._debounce_timer = self.set_timer(
-                    0.2,  # 200ms debounce
-                    self._select_pending_pod
-                )
+                self._debounce_timer = self.set_timer(0.2, self._select_pending_pod)
 
     def _select_pending_pod(self) -> None:
-        """Select the pending pod after debounce timer"""
         if self._pending_pod_index is not None and self._pending_pod_index < len(self.pods):
             self.selected_pod = self.pods[self._pending_pod_index]
             self.selected_container = None
-            # Clear active containers so they get reset to all containers
             self.active_containers.clear()
             self.refresh_containers()
             self.show_pod_info()
@@ -1649,30 +1486,23 @@ class LazyK8sApp(App):
             self._pending_pod_index = None
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        """Handle list item selection (Enter key)"""
         if event.list_view.id == "pods-list":
-            # Pod selected - cancel debounce and select immediately
             if self._debounce_timer is not None:
                 self._debounce_timer.stop()
-
             if isinstance(event.item, PodItem):
                 self.selected_pod = event.item.pod
                 self.selected_container = None
-                # Clear active containers so they get reset to all containers
                 self.active_containers.clear()
                 self.refresh_containers()
                 self.show_pod_info()
                 self.show_pod_logs()
                 self.show_pod_events()
                 self.show_pod_metadata()
-
         elif event.list_view.id == "containers-list":
-            # Container selected with Enter - just mark as selected
             if isinstance(event.item, ContainerItem):
                 self.selected_container = event.item.container_name
 
     def action_refresh(self) -> None:
-        """Refresh the view"""
         self.refresh_pods()
         if self.selected_pod:
             self.refresh_containers()
@@ -1680,19 +1510,15 @@ class LazyK8sApp(App):
             self.show_pod_logs()
 
     def action_change_namespace(self) -> None:
-        """Open namespace selector modal"""
         namespaces = self.k8s_client.get_namespaces()
         current_namespace = self.k8s_client.get_current_namespace()
 
         def handle_namespace_selection(selected_namespace: Optional[str]) -> None:
-            """Handle namespace selection from modal"""
             if selected_namespace and selected_namespace != current_namespace:
                 self.k8s_client.set_namespace(selected_namespace)
                 self.current_namespace = selected_namespace
                 self.refresh_status_bar()
                 self.refresh_pods()
-
-                # Auto-select first pod if available
                 if self.pods:
                     self.selected_pod = self.pods[0]
                     self.refresh_containers()
@@ -1704,25 +1530,15 @@ class LazyK8sApp(App):
                     self.show_pod_info()
                     self.show_pod_logs()
 
-        self.push_screen(
-            NamespaceSelector(namespaces, current_namespace),
-            handle_namespace_selection
-        )
+        self.push_screen(NamespaceSelector(namespaces, current_namespace), handle_namespace_selection)
 
     def action_cluster_overview(self) -> None:
-        """Open cluster overview or context selector if multiple contexts"""
-        # Get all contexts
         contexts, current_context = self.k8s_client.get_contexts()
-
-        # If multiple contexts, show selector first
         if len(contexts) > 1:
             def handle_context_selection(selected_context: Optional[str]) -> None:
-                """Handle context selection from modal"""
                 if selected_context and selected_context != current_context.get('name', ''):
-                    # Switch context
                     success = self.k8s_client.switch_context(selected_context)
                     if success:
-                        # Refresh everything
                         self.refresh_status_bar()
                         self.refresh_pods()
                         self.selected_pod = None
@@ -1731,30 +1547,18 @@ class LazyK8sApp(App):
                         self.refresh_containers()
                         self.show_pod_info()
                         self.show_pod_logs()
-
-                # Show cluster overview
                 self.push_screen(ClusterOverview(self.k8s_client))
-
-            self.push_screen(
-                ClusterSelector(contexts, current_context),
-                handle_context_selection
-            )
+            self.push_screen(ClusterSelector(contexts, current_context), handle_context_selection)
         else:
-            # Single context, just show overview
             self.push_screen(ClusterOverview(self.k8s_client))
 
     def action_view_logs(self) -> None:
-        """View logs for selected pod"""
-        if self.selected_pod:
-            self.show_pod_logs()
+        if self.selected_pod: self.show_pod_logs()
 
     def update_logs_title(self) -> None:
-        """Update the logs container title to show active tab"""
         try:
             logs_tabs = self.query_one("#logs-tabs", TabbedContent)
             active_tab = logs_tabs.active
-
-            # Build title with active tab highlighted
             if active_tab == "logs-tab":
                 title = "[cyan](L)ogs[/] | [dim](E)vents[/] | [dim](M)etadata[/]"
             elif active_tab == "events-tab":
@@ -1763,195 +1567,112 @@ class LazyK8sApp(App):
                 title = "[dim](L)ogs[/] | [dim](E)vents[/] | [cyan](M)etadata[/]"
             else:
                 title = "(L)ogs | (E)vents | (M)etadata"
-
-            # Add following indicator if active
             if self.following_logs and active_tab == "logs-tab":
                 title = title.replace("(L)ogs", "(L)ogs [green]●[/]")
-
             self.query_one("#logs-container").border_title = title
-        except Exception:
-            pass
+        except Exception: pass
 
     def action_switch_tab(self, tab_id: str) -> None:
-        """Switch to a specific tab"""
         try:
             logs_tabs = self.query_one("#logs-tabs", TabbedContent)
             logs_tabs.active = tab_id
             self.update_logs_title()
-        except Exception:
-            pass
+        except Exception: pass
 
     def action_scroll_log_left(self) -> None:
-        """Scroll the active log panel left"""
         try:
             logs_tabs = self.query_one("#logs-tabs", TabbedContent)
             active_tab = logs_tabs.active
-
-            # Get the active panel
-            if active_tab == "logs-tab":
-                panel = self.query_one("#logs-panel", RichLog)
-            elif active_tab == "events-tab":
-                panel = self.query_one("#events-panel", RichLog)
-            elif active_tab == "metadata-tab":
-                panel = self.query_one("#metadata-panel", RichLog)
-            else:
-                return
-
-            # Scroll left
+            panel = self.query_one(f"#{active_tab.replace('tab', 'panel')}", RichLog)
             panel.scroll_left(animate=False)
-        except Exception:
-            pass
+        except Exception: pass
 
     def action_scroll_log_right(self) -> None:
-        """Scroll the active log panel right"""
         try:
             logs_tabs = self.query_one("#logs-tabs", TabbedContent)
             active_tab = logs_tabs.active
-
-            # Get the active panel
-            if active_tab == "logs-tab":
-                panel = self.query_one("#logs-panel", RichLog)
-            elif active_tab == "events-tab":
-                panel = self.query_one("#events-panel", RichLog)
-            elif active_tab == "metadata-tab":
-                panel = self.query_one("#metadata-panel", RichLog)
-            else:
-                return
-
-            # Scroll right
+            panel = self.query_one(f"#{active_tab.replace('tab', 'panel')}", RichLog)
             panel.scroll_right(animate=False)
-        except Exception:
-            pass
+        except Exception: pass
 
     def action_cursor_down(self) -> None:
-        """Move cursor down in focused list"""
         try:
-            focused = self.focused
-            if isinstance(focused, ListView):
-                focused.action_cursor_down()
-        except Exception:
-            pass
+            if isinstance(self.focused, ListView): self.focused.action_cursor_down()
+        except Exception: pass
 
     def action_cursor_up(self) -> None:
-        """Move cursor up in focused list"""
         try:
-            focused = self.focused
-            if isinstance(focused, ListView):
-                focused.action_cursor_up()
-        except Exception:
-            pass
+            if isinstance(self.focused, ListView): self.focused.action_cursor_up()
+        except Exception: pass
 
     def on_key(self, event) -> None:
-        """Handle key presses for custom navigation"""
         key = event.key
         pods_list = self.query_one("#pods-list", ListView)
         containers_list = self.query_one("#containers-list", ListView)
 
-        # When pods panel is focused
         if self.focused == pods_list:
-            # Left/right arrows or h/l cycle through containers
             if key in ["left", "right", "h", "l"]:
                 if len(containers_list) > 0:
-                    if key in ["right", "l"]:
-                        containers_list.action_cursor_down()
-                    else:  # left or h
-                        containers_list.action_cursor_up()
+                    if key in ["right", "l"]: containers_list.action_cursor_down()
+                    else: containers_list.action_cursor_up()
                     event.prevent_default()
                     event.stop()
                     return
-
-            # Space toggles container logs
             elif key == "space":
                 self.action_toggle_container()
                 event.prevent_default()
                 event.stop()
                 return
 
-        # When logs container has focus (check if focused widget is inside logs container)
         try:
             logs_tabs = self.query_one("#logs-tabs", TabbedContent)
-            logs_container = self.query_one("#logs-container")
-
-            # Check if the focused widget is the TabbedContent or any of its children
             if self.focused == logs_tabs or (self.focused and self.focused in logs_tabs.query("*")):
                 if key in ["left", "right", "h", "l"]:
-                    if key in ["left", "h"]:
-                        self.action_scroll_log_left()
-                    else:
-                        self.action_scroll_log_right()
+                    if key in ["left", "h"]: self.action_scroll_log_left()
+                    else: self.action_scroll_log_right()
                     event.prevent_default()
                     event.stop()
                     return
-        except Exception:
-            pass
+        except Exception: pass
 
     def action_toggle_container(self) -> None:
-        """Toggle container log visibility (Space key)"""
         containers_list = self.query_one("#containers-list", ListView)
-
-        # Get the highlighted item from containers list
         if containers_list.highlighted_child and isinstance(containers_list.highlighted_child, ContainerItem):
             item = containers_list.highlighted_child
             container_name = item.container_name
-
-            # Toggle container in active set
-            if container_name in self.active_containers:
-                self.active_containers.discard(container_name)
-            else:
-                self.active_containers.add(container_name)
-
-            # Update the item's visual state
+            if container_name in self.active_containers: self.active_containers.discard(container_name)
+            else: self.active_containers.add(container_name)
             item.update_active_state(container_name in self.active_containers)
-
-            # Refresh logs to show/hide this container's logs
             self.show_pod_logs()
 
     def action_toggle_follow(self) -> None:
-        """Toggle log following"""
         self.following_logs = not self.following_logs
-
-        # Update title to show following indicator
         self.update_logs_title()
-
-        # Start/stop following timer
         if self.following_logs:
-            if self._log_follow_timer is None:
-                self._log_follow_timer = self.set_interval(2.0, self._refresh_logs)
+            if self._log_follow_timer is None: self._log_follow_timer = self.set_interval(2.0, self._refresh_logs)
         else:
             if self._log_follow_timer is not None:
                 self._log_follow_timer.stop()
                 self._log_follow_timer = None
 
     def _refresh_logs(self) -> None:
-        """Refresh logs when following"""
-        if self.following_logs and self.selected_pod:
-            self.show_pod_logs()
+        if self.following_logs and self.selected_pod: self.show_pod_logs()
 
     def action_open_shell(self) -> None:
-        """Open shell in selected pod/container"""
-        if not self.selected_pod:
-            return
-
+        if not self.selected_pod: return
         containers = self.k8s_client.get_container_names(self.selected_pod)
-        if not containers:
-            return
+        if not containers: return
 
-        # Use highlighted container if containers list is focused, otherwise use first container
         containers_list = self.query_one("#containers-list", ListView)
-        if self.focused == containers_list and containers_list.highlighted_child:
-            if isinstance(containers_list.highlighted_child, ContainerItem):
-                container = containers_list.highlighted_child.container_name
-            else:
-                container = containers[0]
+        if self.focused == containers_list and containers_list.highlighted_child and isinstance(containers_list.highlighted_child, ContainerItem):
+            container = containers_list.highlighted_child.container_name
         else:
             container = containers[0]
 
         namespace = self.k8s_client.get_current_namespace()
         pod_name = self.selected_pod.metadata.name
 
-        # Exit the TUI temporarily
         with self.suspend():
-            # Colorful banner with separator line
             separator = "─" * 60
             print(f"\033[36m{separator}\033[0m")
             print(f"\033[36m→ \033[1;37mEntering Shell\033[0m")
@@ -1962,60 +1683,32 @@ class LazyK8sApp(App):
 
             for shell in ["/bin/bash", "/bin/sh", "/bin/ash"]:
                 try:
-                    result = subprocess.run([
-                        "kubectl", "exec", "-it",
-                        "-n", namespace,
-                        pod_name,
-                        "-c", container,
-                        "--", shell
-                    ])
-                    if result.returncode == 0:
-                        break
-                except Exception:
-                    continue
+                    result = subprocess.run(["kubectl", "exec", "-it", "-n", namespace, pod_name, "-c", container, "--", shell])
+                    if result.returncode == 0: break
+                except Exception: continue
 
-            # Colorful exit message with separator
             print(f"\n\033[36m{separator}\033[0m")
             print(f"\033[36m← \033[1;37mExited Shell\033[0m")
             print(f"\033[2mPress \033[0m\033[1;32mEnter\033[0m\033[2m to return to \033[0m\033[1;36mlazyk8s\033[0m\033[2m...\033[0m")
             print(f"\033[36m{separator}\033[0m")
             input()
 
-    def action_open_alumet(self) -> None:
-        """Active ou désactive l'affichage du moniteur Alumet intégré."""
-        self.show_alumet = not self.show_alumet
-
     def action_delete_pod(self) -> None:
-        """Delete the selected pod after confirmation"""
-        if not self.selected_pod:
-            return
-
+        if not self.selected_pod: return
         pod_name = self.selected_pod.metadata.name
         namespace = self.k8s_client.get_current_namespace()
 
         def handle_confirmation(confirmed: bool) -> None:
-            """Handle the confirmation response"""
             if confirmed:
-                # Delete the pod
                 success = self.k8s_client.delete_pod(pod_name)
                 if success:
-                    # Clear selection and refresh immediately
                     self.selected_pod = None
                     self.selected_container = None
                     self.refresh_pods()
-
-                    # Schedule additional refreshes to show the replacement pod
                     self.set_timer(1.0, self.refresh_pods)
                     self.set_timer(3.0, self.refresh_pods)
 
-        # Show confirmation dialog
-        self.push_screen(
-            ConfirmDialog(
-                f"Delete pod [b]{pod_name}[/b] in namespace [b]{namespace}[/b]?\n\nThis action cannot be undone.",
-                title="Confirm Pod Deletion"
-            ),
-            handle_confirmation
-        )
+        self.push_screen(ConfirmDialog(f"Delete pod [b]{pod_name}[/b] in namespace [b]{namespace}[/b]?\n\nThis action cannot be undone.", title="Confirm Pod Deletion"), handle_confirmation)
 
 
 class Gui:
