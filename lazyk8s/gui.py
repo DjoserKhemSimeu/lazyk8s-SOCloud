@@ -1,6 +1,9 @@
 """Textual-based GUI for lazyk8s"""
 
 import subprocess
+import shutil
+import os
+from pathlib import Path
 from typing import List, Optional
 from rich.text import Text
 from textual import work, on
@@ -1080,6 +1083,7 @@ class LazyK8sApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
+        Binding("a", "open_alumet", "Alumet"),
         Binding("n", "change_namespace", "Namespace"),
         Binding("c", "cluster_overview", "Cluster"),
         Binding("x", "open_shell", "Shell"),
@@ -1771,6 +1775,49 @@ class LazyK8sApp(App):
             print(f"\033[2mPress \033[0m\033[1;32mEnter\033[0m\033[2m to return to \033[0m\033[1;36mlazyk8s\033[0m\033[2m...\033[0m")
             print(f"\033[36m{separator}\033[0m")
             input()
+
+    def action_open_alumet(self) -> None:
+        """Launch the alumet_top_GPU.py script in an external terminal."""
+        # Locate the script next to this module
+        script_path = Path(__file__).parent / "alumet_top_GPU.py"
+        if not script_path.exists():
+            try:
+                self.app_config.logger.error(f"alumet script not found: {script_path}")
+            except Exception:
+                pass
+            return
+
+        # Detect available terminal emulator
+        terminals = ["gnome-terminal", "konsole", "xfce4-terminal", "xterm", "alacritty", "kitty", "urxvt"]
+        terminal = None
+        for t in terminals:
+            if shutil.which(t):
+                terminal = t
+                break
+
+        # Build command based on terminal
+        if terminal:
+            if terminal == "gnome-terminal":
+                cmd = [terminal, "--", "bash", "-lc", f'python3 "{script_path}"; exec bash']
+            elif terminal in ("konsole",):
+                cmd = [terminal, "-e", f'bash -lc "python3 \"{script_path}\"; exec bash"']
+            else:
+                # Generic -e support
+                cmd = [terminal, "-e", "bash", "-lc", f'python3 "{script_path}"; exec bash']
+        else:
+            # No terminal emulator found: run in background (no window)
+            cmd = ["python3", str(script_path)]
+
+        # Launch the terminal while suspending the TUI briefly
+        try:
+            with self.suspend():
+                # Use Popen so we don't block the TUI if terminal opens a window
+                subprocess.Popen(cmd)
+        except Exception as e:
+            try:
+                self.app_config.logger.error(f"Failed to launch alumet: {e}")
+            except Exception:
+                pass
 
         # Refresh the display after returning
         self.refresh_pods()
