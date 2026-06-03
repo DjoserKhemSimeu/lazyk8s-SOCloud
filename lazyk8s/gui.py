@@ -1230,12 +1230,12 @@ class LazyK8sApp(App):
                     self.alumet_last_seen_rapl[m_id] = (curr_ts, val)
 
                 # Fallback: if RAPL energy isn't available, use graceful instantaneous
-                # power reported by 'grace_instant_power' (assumed in Watts).
-                elif "grace_instant_power" in m_name and "domain=package_total" in line:
+                # power reported by 'grace_instant_power' mW.
+                elif "grace_instant_power" in m_name and "grace_total" in line:
                     try:
                         # Accept reasonable watt values and set as current power
                         if 0.0 <= val < 10000.0:
-                            self.alumet_node_data[node_name]['rapl_consumed_energy']['curr'] = val
+                            self.alumet_node_data[node_name]['rapl_consumed_energy']['curr'] = val/1000
                             self.alumet_node_data[node_name]['power_source'] = 'grace-hopper'
                     except Exception:
                         pass
