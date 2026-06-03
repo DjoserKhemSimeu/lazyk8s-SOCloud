@@ -1102,13 +1102,40 @@ class LazyK8sApp(App):
                     yield RichLog(id="alumet-panel", highlight=False, markup=True)
         yield Footer()
 
+
+
+
+    def debug_log(self, message: str, level: str = "INFO") -> None:
+        """Écrit un message de débug de manière sécurisée si le panneau est prêt."""
+        # Sécurité : Si l'application n'est pas pleinement active, on écrit dans la console de dev standard
+        if not getattr(self, "is_running", False):
+            self.log(f"[{level.upper()}] {message}")
+            return
+
+        colors = {"INFO": "cyan", "WARN": "yellow", "ERROR": "red", "SUCCESS": "green"}
+        color = colors.get(level.upper(), "white")
+        
+        from datetime import datetime
+        now = datetime.now().strftime("%H:%M:%S")
+        formatted_msg = f"[{color}][DEBUG {now}] [{level.upper()}] {message}[/{color}]"
+        
+        try:
+            # On vérifie d'abord si le panel est monté pour éviter le crash synchrone
+            panel = self.query_one("#alumet-panel", RichLog)
+            if panel:
+                self.call_from_thread(panel.write, formatted_msg)
+        except Exception:
+            # Fallback vers la console invisible si le widget n'est pas encore accessible
+            self.log(formatted_msg)
+
+
     alumet_node_data = {}
     alumet_lock = __import__("threading").Lock()
     alumet_last_seen_rapl = {}
 
     @work(exclusive=True, thread=True)
     def start_alumet_stream(self) -> None:
-        """Déclenche le streaming multi-nœuds calqué sur le script fonctionnel."""
+        """Déclenche le streaming multi-nœuds sans bloquer l'application."""
         import subprocess
         import threading
         import time
@@ -1121,8 +1148,11 @@ class LazyK8sApp(App):
             output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
             count = 0
             for line in output.split('\n'):
+                self.debug_log("Recherche des pods Alumet lancée...")
                 if "alumet-relay-client" in line and len(line.split()) == 2:
                     p_name, n_name = line.split()
+                    self.debug_log(f"Pod trouvé : {p_name}", level="SUCCESS")
+                    self.debug_log(f"Pod trouvé : {p_name}", level="SUCCESS")
                     threading.Thread(target=self._stream_alumet_node_data, args=(p_name, n_name), daemon=True).start()
                     count += 1
             
@@ -1131,20 +1161,23 @@ class LazyK8sApp(App):
             else:
                 self.safe_alumet_write(f"[green]✅ {count} flux Alumet nœud/pod démarrés avec succès.[/]\n")
                 
-            while True:
-                time.sleep(1)
-                if getattr(self, "show_alumet", False):
-                    self.call_from_thread(self._refresh_alumet_display)
+                # FIX CRITIQUE : Au lieu d'un 'while True' bloquant, on délègue le rafraîchissement
+                # à un intervalle natif de Textual, géré proprement par l'Event Loop.
+                self.call_from_thread(self.set_interval, 1.0, self._trigger_alumet_refresh)
 
         except Exception as e:
             self.safe_alumet_write(f"[red]❌ Erreur d'initialisation : {e}[/]")
 
+    def _trigger_alumet_refresh(self) -> None:
+        """Déclenché toutes les secondes par l'intervalle Textual."""
+        if getattr(self, "show_alumet", False):
+            self._refresh_alumet_display()
     def _stream_alumet_node_data(self, pod_name: str, node_name: str) -> None:
         import subprocess
         from datetime import datetime, timezone
         
         metrics_list = [
-            "rapl_consumed_energy", "cpu_percent", "memory_usage",
+            "rapl_consumed_energy","grace_instant_power", "cpu_percent", "memory_usage",
             "cgroup_memory_anonymous", "cgroup_memory_file",
             "cgroup_memory_kernel_stack", "cgroup_memory_pagetables",
             "nvml_instant_power", "nvml_temperature_gpu", 
@@ -1163,7 +1196,10 @@ class LazyK8sApp(App):
             line = process.stdout.readline()
             if not line: break
             line = line.strip()
-            if ";" not in line: continue
+            if ";" not in line:
+                if "ERROR" in line or "WARN" in line:
+                    self.safe_alumet_write(f"[bold red][POD LOG] {line}[/bold red]")
+                continue
             
             parts = line.split(";")
             if len(parts) < 3: continue
@@ -1176,8 +1212,10 @@ class LazyK8sApp(App):
             with self.alumet_lock:
                 if node_name not in self.alumet_node_data:
                     self.alumet_node_data[node_name] = {m: {'curr': 0.0} for m in metrics_list}
-                    self.alumet_node_data[node_name]['pods_cpu_usage'] = {} 
+                    self.alumet_node_data[node_name]['pods_cpu_usage'] = {}
                     self.alumet_node_data[node_name]['gpus'] = {}
+                    # Track which metric source is used for power (rapl or grace-hopper)
+                    self.alumet_node_data[node_name]['power_source'] = 'unknown'
 
                 if "rapl_consumed_energy" in m_name and "domain=package_total" in line:
                     m_id = f"{node_name}_package_total"
@@ -1185,10 +1223,22 @@ class LazyK8sApp(App):
                         p_ts, _ = self.alumet_last_seen_rapl[m_id]
                         dt = curr_ts - p_ts
                         if 0.001 < dt < 5.0:
-                            watts = val / dt
-                            if 0 <= watts < 1000.0:
-                                self.alumet_node_data[node_name]['rapl_consumed_energy']['curr'] = watts
+                                watts = val / dt
+                                if 0 <= watts < 1000.0:
+                                    self.alumet_node_data[node_name]['rapl_consumed_energy']['curr'] = watts
+                                    self.alumet_node_data[node_name]['power_source'] = 'rapl'
                     self.alumet_last_seen_rapl[m_id] = (curr_ts, val)
+
+                # Fallback: if RAPL energy isn't available, use graceful instantaneous
+                # power reported by 'grace_instant_power' (assumed in Watts).
+                elif "grace_instant_power" in m_name:
+                    try:
+                        # Accept reasonable watt values and set as current power
+                        if 0.0 <= val < 10000.0:
+                            self.alumet_node_data[node_name]['rapl_consumed_energy']['curr'] = val
+                            self.alumet_node_data[node_name]['power_source'] = 'grace-hopper'
+                    except Exception:
+                        pass
 
                 elif "nvml_" in m_name:
                     gpu_id = parts[4] if len(parts) > 4 else "0"
@@ -1221,23 +1271,29 @@ class LazyK8sApp(App):
 
             with self.alumet_lock:
                 if not self.alumet_node_data:
-                    panel.write("[bold blink cyan]⏳ ATTENTE DE DONNÉES ALUMET DES NŒUDS...[/]")
+                    panel.write("[bold blink cyan] ATTENTE DE DONNÉES ALUMET DES NŒUDS...[/]")
                     return
 
                 for node, data in sorted(self.alumet_node_data.items()):
-                    panel.write(f"[bold reverse cyan] 🖥️  NODE: {node} [/bold reverse cyan]")
+                    panel.write(f"[bold reverse cyan]   NODE: {node} [/bold reverse cyan]")
                     
                     p_curr = data['rapl_consumed_energy']['curr']
-                    panel.write(f"  [bold yellow]⚡ TOTAL POWER (RAPL):[/] [green]{p_curr:>6.2f} W[/green]")
+                    source = data.get('power_source', 'unknown')
+                    if source == 'grace-hopper':
+                        panel.write(f"  [bold yellow] TOTAL POWER (grace-hopper):[/] [green]{p_curr:>6.2f} W[/green]")
+                    elif source == 'rapl':
+                        panel.write(f"  [bold yellow] TOTAL POWER (RAPL):[/] [green]{p_curr:>6.2f} W[/green]")
+                    else:
+                        panel.write(f"  [bold yellow] TOTAL POWER:[/] [green]{p_curr:>6.2f} W[/green]")
                     
-                    panel.write("  [bold blue]💾 DETAILED MEMORY (MiB):[/]")
+                    panel.write("  [bold blue] DETAILED MEMORY (MiB):[/]")
                     mem_keys = ["cgroup_memory_anonymous", "cgroup_memory_file", "cgroup_memory_kernel_stack", "cgroup_memory_pagetables"]
                     mem_line = "    " + " | ".join([f"{m[14:].upper()}: [bold]{data[m]['curr']:.2f}[/] MiB" for m in mem_keys if m in data])
                     panel.write(mem_line)
 
                     gpus = data.get('gpus', {})
                     if gpus:
-                        panel.write("  [bold magenta]🎮 GPU METRICS:[/]")
+                        panel.write("  [bold magenta] GPU METRICS:[/]")
                         for g_id, g_metrics in sorted(gpus.items()):
                             pwr = g_metrics.get('nvml_instant_power', {}).get('curr', 0.0)
                             tmp = g_metrics.get('nvml_temperature_gpu', {}).get('curr', 0.0)
@@ -1247,7 +1303,7 @@ class LazyK8sApp(App):
 
                     pods = sorted(data.get('pods_cpu_usage', {}).items(), key=lambda x: x[1], reverse=True)[:4]
                     if pods:
-                        panel.write("  [bold orange3]🔥 TOP PODS (CPU%):[/]")
+                        panel.write("  [bold orange3] TOP PODS (CPU%):[/]")
                         for p_name, p_val in pods:
                             panel.write(f"    ├─ {p_name[:30]:30} [cyan]{p_val:>5.1f}%[/cyan]")
                     
@@ -1267,6 +1323,7 @@ class LazyK8sApp(App):
         self.query_one("#alumet-panel", RichLog).write(text)
 
     def watch_show_alumet(self, show_alumet: bool) -> None:
+        """Bascule visuellement et de manière forcée entre K8s et Alumet."""
         try:
             tabs = self.query_one("#logs-tabs")
             alumet_panel = self.query_one("#alumet-panel")
@@ -1276,7 +1333,10 @@ class LazyK8sApp(App):
                 tabs.display = False
                 alumet_panel.display = True
                 container.border_title = "[bold green]ALUMET ENERGY MONITOR FIELD (Press 'a' to exit)[/]"
-                # Forcer un rafraîchissement visuel dès l'ouverture
+                
+                # On force un premier texte pour prouver que le panneau est ouvert
+                alumet_panel.clear()
+                alumet_panel.write("[bold yellow]⏳ Connexion au flux Alumet en cours...[/]")
                 self._refresh_alumet_display()
             else:
                 tabs.display = True
@@ -1374,7 +1434,13 @@ class LazyK8sApp(App):
             logs = self.k8s_client.get_pod_logs_all_containers(self.selected_pod.metadata.name, active, lines=100)
             self._write_prefixed_logs(logs_panel, logs)
 
-    def _write_logs(self, logs_panel: RichLog, logs: str, container_name: Optional[str]) -> None:
+    def _write_logs(self, logs_panel: RichLog, logs: Optional[str], container_name: Optional[str]) -> None:
+        """Write logs with colorization, checking if logs are available."""
+        # FIX : Si Kubernetes n'a renvoyé aucun log (None), on affiche un message d'attente au lieu de crash
+        if logs is None:
+            logs_panel.write("[yellow]⏳ En attente des logs du conteneur (Pod en cours d'initialisation ou indisponible)...[/]")
+            return
+
         for line in logs.split("\n"):
             if line:
                 if any(level in line.upper() for level in ["ERROR", "FATAL"]):
@@ -1384,7 +1450,13 @@ class LazyK8sApp(App):
                 else:
                     logs_panel.write(line)
 
-    def _write_prefixed_logs(self, logs_panel: RichLog, logs: str) -> None:
+    def _write_prefixed_logs(self, logs_panel: RichLog, logs: Optional[str]) -> None:
+        """Write prefixed logs, checking if logs are available."""
+        # FIX : Même sécurité si le pod possède plusieurs conteneurs
+        if logs is None:
+            logs_panel.write("[yellow]⏳ En attente des logs combinés...[/]")
+            return
+
         for line in logs.split("\n"):
             if not line: continue
             if line.startswith("["):
@@ -1406,7 +1478,6 @@ class LazyK8sApp(App):
                     logs_panel.write(line)
             else:
                 logs_panel.write(line)
-
     def show_pod_events(self) -> None:
         events_panel = self.query_one("#events-panel", RichLog)
         events_panel.clear()
@@ -1606,10 +1677,20 @@ class LazyK8sApp(App):
         except Exception: pass
 
     def on_key(self, event) -> None:
+        """Handle key presses for custom navigation and view toggles"""
         key = event.key
         pods_list = self.query_one("#pods-list", ListView)
         containers_list = self.query_one("#containers-list", ListView)
 
+        # FIX ULTRA-CRITIQUE : Intercepter la touche Alumet immédiatement, 
+        # peu importe quel composant (onglets, listes, etc.) possède le focus actif.
+        if key in ["a", "A"]:
+            self.action_open_alumet()
+            event.prevent_default()
+            event.stop()
+            return
+
+        # Navigation standard quand le panneau des pods a le focus
         if self.focused == pods_list:
             if key in ["left", "right", "h", "l"]:
                 if len(containers_list) > 0:
@@ -1624,6 +1705,7 @@ class LazyK8sApp(App):
                 event.stop()
                 return
 
+        # Défilement horizontal des logs standards
         try:
             logs_tabs = self.query_one("#logs-tabs", TabbedContent)
             if self.focused == logs_tabs or (self.focused and self.focused in logs_tabs.query("*")):
@@ -1657,6 +1739,10 @@ class LazyK8sApp(App):
 
     def _refresh_logs(self) -> None:
         if self.following_logs and self.selected_pod: self.show_pod_logs()
+    
+    def action_open_alumet(self) -> None: 
+        """Active ou désactive l'affichage du moniteur Alumet intégré."""
+        self.show_alumet = not self.show_alumet
 
     def action_open_shell(self) -> None:
         if not self.selected_pod: return
