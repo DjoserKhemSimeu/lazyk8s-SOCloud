@@ -1231,7 +1231,7 @@ class LazyK8sApp(App):
 
                 # Fallback: if RAPL energy isn't available, use graceful instantaneous
                 # power reported by 'grace_instant_power' (assumed in Watts).
-                elif "grace_instant_power" in m_name:
+                elif "grace_instant_power" in m_name and "domain=package_total" in line:
                     try:
                         # Accept reasonable watt values and set as current power
                         if 0.0 <= val < 10000.0:
