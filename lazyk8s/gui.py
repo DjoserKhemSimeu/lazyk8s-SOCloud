@@ -1261,7 +1261,7 @@ class LazyK8sApp(App):
                                 dt = curr_ts - p_ts
                                 if 0.001 < dt < 5.0:
                                     # Conversion des Joules en Watts
-                                    watts = val / dt
+                                    watts = val #/ dt
                                     if 0 <= watts < 10000.0:
                                         if p_name not in self.alumet_node_data[node_name]['pods_gpu_usage']:
                                             self.alumet_node_data[node_name]['pods_gpu_usage'][p_name] = {}
