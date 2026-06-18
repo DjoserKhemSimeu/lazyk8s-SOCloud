@@ -1181,7 +1181,7 @@ class LazyK8sApp(App):
             "cgroup_memory_anonymous", "cgroup_memory_file",
             "cgroup_memory_kernel_stack", "cgroup_memory_pagetables",
             "nvml_instant_power", "nvml_temperature_gpu", 
-            "nvml_gpu_utilization", "nvml_memory_utilization"
+            "nvml_gpu_utilization", "nvml_memory_utilization","gpu_pod_attr"
         ]
 
         def parse_ts(ts_str):
@@ -1192,6 +1192,10 @@ class LazyK8sApp(App):
         cmd = ["kubectl", "exec", "-i", pod_name, "--", "stdbuf", "-oL", "tail", "-f", "/tmp/energy_data.csv"]
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
         
+
+        if not hasattr(self, 'alumet_last_seen_gpu_pod'):
+            self.alumet_last_seen_gpu_pod = {}
+
         while True:
             line = process.stdout.readline()
             if not line: break
@@ -1213,6 +1217,7 @@ class LazyK8sApp(App):
                 if node_name not in self.alumet_node_data:
                     self.alumet_node_data[node_name] = {m: {'curr': 0.0} for m in metrics_list}
                     self.alumet_node_data[node_name]['pods_cpu_usage'] = {}
+                    self.alumet_node_data[node_name]['pods_gpu_usage'] = {}
                     self.alumet_node_data[node_name]['gpus'] = {}
                     # Track which metric source is used for power (rapl or grace-hopper)
                     self.alumet_node_data[node_name]['power_source'] = 'unknown'
@@ -1240,6 +1245,32 @@ class LazyK8sApp(App):
                             self.alumet_node_data[node_name]['power_source'] = 'grace-hopper'
                     except Exception:
                         pass
+                elif "gpu_pod_attr" in m_name:
+                    tags = parts[7] if len(parts) > 7 else ""
+                    if "name=" in tags:
+                        try:
+                            # Extraction du nom du pod ("name=ollama-server...")
+                            p_name = tags.split("name=")[1].split(",")[0]
+                            gpu_id = parts[4]
+                            
+                            # Clé unique pour calculer le delta de temps (Noeud + Pod + ID du GPU)
+                            m_id = f"{node_name}_{p_name}_{gpu_id}"
+                            
+                            if m_id in self.alumet_last_seen_gpu_pod:
+                                p_ts, _ = self.alumet_last_seen_gpu_pod[m_id]
+                                dt = curr_ts - p_ts
+                                if 0.001 < dt < 5.0:
+                                    # Conversion des Joules en Watts
+                                    watts = val / dt
+                                    if 0 <= watts < 10000.0:
+                                        if p_name not in self.alumet_node_data[node_name]['pods_gpu_usage']:
+                                            self.alumet_node_data[node_name]['pods_gpu_usage'][p_name] = {}
+                                        # On stocke la conso de ce pod spécifiquement pour ce GPU
+                                        self.alumet_node_data[node_name]['pods_gpu_usage'][p_name][gpu_id] = watts
+                            
+                            self.alumet_last_seen_gpu_pod[m_id] = (curr_ts, val)
+                        except Exception:
+                            pass
 
                 elif "nvml_" in m_name:
                     gpu_id = parts[4] if len(parts) > 4 else "0"
@@ -1302,11 +1333,25 @@ class LazyK8sApp(App):
                             mem = g_metrics.get('nvml_memory_utilization', {}).get('curr', 0.0)
                             panel.write(f"    └─ [bold]ID {g_id[-12:]}:[/] Power: [green]{pwr:.1f}W[/] | Temp: {tmp:.1f}°C | Util: [cyan]{util:.1f}%[/] | Mem: {mem:.1f}%")
 
-                    pods = sorted(data.get('pods_cpu_usage', {}).items(), key=lambda x: x[1], reverse=True)[:4]
-                    if pods:
+                    # Affichage des TOP PODS (CPU)
+                    pods_cpu = sorted(data.get('pods_cpu_usage', {}).items(), key=lambda x: x[1], reverse=True)[:4]
+                    if pods_cpu:
                         panel.write("  [bold orange3] TOP PODS (CPU%):[/]")
-                        for p_name, p_val in pods:
+                        for p_name, p_val in pods_cpu:
                             panel.write(f"    ├─ {p_name[:30]:30} [cyan]{p_val:>5.1f}%[/cyan]")
+
+                    pods_gpu = data.get('pods_gpu_usage', {})
+                    if pods_gpu:
+                        # On additionne la conso de tous les GPUs pour un même pod
+                        pod_gpu_totals = {p: sum(gpus.values()) for p, gpus in pods_gpu.items()}
+                        sorted_gpu_pods = sorted(pod_gpu_totals.items(), key=lambda x: x[1], reverse=True)[:4]
+                        
+                        # On n'affiche le bloc que s'il y a au moins un pod qui consomme un minimum (ex: > 0.1 W)
+                        if any(val > 0.1 for _, val in sorted_gpu_pods):
+                            panel.write("  [bold bright_green] TOP PODS (GPU POWER):[/]")
+                            for p_name, p_val in sorted_gpu_pods:
+                                if p_val > 0.1:
+                                    panel.write(f"    ├─ {p_name[:30]:30} [green]{p_val:>5.1f} W[/green]")
                     
                     panel.write("─" * 50)
         except Exception:
