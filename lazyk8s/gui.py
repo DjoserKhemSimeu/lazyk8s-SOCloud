@@ -1181,7 +1181,7 @@ class LazyK8sApp(App):
             "cgroup_memory_anonymous", "cgroup_memory_file",
             "cgroup_memory_kernel_stack", "cgroup_memory_pagetables",
             "nvml_instant_power", "nvml_temperature_gpu", 
-            "nvml_gpu_utilization", "nvml_memory_utilization","gpu_pod_attr"
+            "nvml_gpu_utilization", "nvml_memory_utilization","gpu_pod_attr_J"
         ]
 
         def parse_ts(ts_str):
@@ -1245,7 +1245,7 @@ class LazyK8sApp(App):
                             self.alumet_node_data[node_name]['power_source'] = 'grace-hopper'
                     except Exception:
                         pass
-                elif "gpu_pod_attr" in m_name:
+                elif "gpu_pod_attr_J" in m_name:
                     tags = parts[7] if len(parts) > 7 else ""
                     if "name=" in tags:
                         try:
