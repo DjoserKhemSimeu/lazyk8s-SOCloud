@@ -1246,7 +1246,7 @@ class LazyK8sApp(App):
                     except Exception:
                         pass
                 elif "gpu_pod_attr_J" in m_name:
-                    tags = parts[7] if len(parts) > 7 else ""
+                    tags = next((p for p in parts if "name=" in p), "")
                     if "name=" in tags:
                         try:
                             # Extraction du nom du pod ("name=ollama-server...")
